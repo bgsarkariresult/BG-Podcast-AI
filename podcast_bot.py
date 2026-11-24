@@ -70,7 +70,7 @@ def tg(msg):
             r = requests.post(
                 f"https://api.telegram.org/bot{tok}/sendMessage",
                 data={"chat_id": chat, "text": msg[:3900], "disable_web_page_preview": True},
-                timeout=20,
+                timeout=12,
             )
             if r.status_code == 200:
                 return
@@ -82,7 +82,9 @@ def tg(msg):
                     wait = int(r.json().get("parameters", {}).get("retry_after", 5))
                 except Exception:
                     wait = 5
-                time.sleep(min(wait + 1, 40))
+                if wait > 10:
+                    return  # do not stall the whole run for a status message
+                time.sleep(wait + 1)
                 continue
         except Exception as e:  # never let alerts crash the bot
             log(f"telegram failed (try {attempt + 1}): {e}")
@@ -182,7 +184,7 @@ def llm_json(prompt):
 
 # ------------------------------------------------------------------ yt-dlp
 def ytdlp(args):
-    base = ["yt-dlp", "--no-warnings", "--no-playlist"]
+    base = ["yt-dlp", "--no-playlist"]
     if Path("cookies.txt").exists():
         base += ["--cookies", "cookies.txt"]
     err = ""
@@ -195,7 +197,42 @@ def ytdlp(args):
         if extra and ("no such option" in low or "unrecognized" in low):
             continue  # old yt-dlp without --js-runtimes
         break
-    raise RuntimeError("yt-dlp failed: " + err[-400:])
+    keep = [ln.strip() for ln in err.splitlines()
+            if ln.startswith(("ERROR", "WARNING")) or "cookie" in ln.lower()]
+    raise RuntimeError("yt-dlp failed: " + (" || ".join(keep) or err)[:900])
+
+
+def cookie_report():
+    """Print a safe summary of cookies.txt (cookie NAMES only, never values) and repair lost tabs."""
+    p = Path("cookies.txt")
+    if not p.exists():
+        log("cookies.txt: NOT FOUND (YT_COOKIES secret is missing or empty)")
+        return
+    raw = p.read_text(encoding="utf-8", errors="ignore").replace("\r\n", "\n")
+    out, names, doms, fixed, bad = [], set(), set(), 0, 0
+    for ln in raw.split("\n"):
+        s = ln.strip()
+        if not s or (s.startswith("#") and not s.startswith("#HttpOnly_")):
+            out.append(ln)
+            continue
+        parts = ln.split("\t")
+        if len(parts) < 7:
+            ws = s.split()
+            if len(ws) == 7:  # tabs were turned into spaces while pasting
+                parts, fixed = ws, fixed + 1
+            else:
+                bad += 1
+                continue
+        out.append("\t".join(parts))
+        doms.add(parts[0].replace("#HttpOnly_", ""))
+        names.add(parts[5])
+    if not out or not out[0].startswith("# Netscape"):
+        out.insert(0, "# Netscape HTTP Cookie File")
+    p.write_text("\n".join(out) + "\n", encoding="utf-8")
+    keys = ["SID", "HSID", "SSID", "SAPISID", "__Secure-1PSID", "__Secure-3PSID", "LOGIN_INFO"]
+    log(f"cookies.txt: {len(names)} cookies, domains={sorted(doms)[:6]}, repaired_lines={fixed}, bad_lines={bad}")
+    log("cookies.txt login cookies present: " + ", ".join(k for k in keys if k in names) +
+        " | missing: " + ", ".join(k for k in keys if k not in names))
 
 
 def extract_id(url):
@@ -701,6 +738,7 @@ def main():
 
     shutil.rmtree(WORK, ignore_errors=True)
     WORK.mkdir(parents=True)
+    cookie_report()
 
     meta = get_meta(url, vid)
     log(f"podcast: {meta['title']} | {meta['channel']} | {meta['duration']}s")

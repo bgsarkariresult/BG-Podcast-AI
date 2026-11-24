@@ -111,7 +111,7 @@ def _gemini_one(prompt, json_mode, model):
     if not GEMINI_KEYS:
         raise RuntimeError("no Gemini keys set")
     last = None
-    for _ in range(len(GEMINI_KEYS) * 2):
+    for attempt in range(len(GEMINI_KEYS) * 4):
         key = GEMINI_KEYS[_key_i % len(GEMINI_KEYS)]
         body = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.7}}
         if json_mode:
@@ -133,10 +133,21 @@ def _gemini_one(prompt, json_mode, model):
             except (KeyError, IndexError, ValueError):
                 last = "empty response: " + r.text[:200]
                 continue
-        last = f"{r.status_code} {r.text[:200]}"
+        last = f"{r.status_code} {r.text[:300]}"
+        log(f"Gemini {model} key#{(_key_i - 1) % len(GEMINI_KEYS) + 1}: HTTP {r.status_code} {r.text[:200]!r}")
         if r.status_code == 404:
             raise ModelNotFound(f"{model}: {r.text[:200]}")
-        time.sleep(5 if r.status_code in (429, 500, 503) else 1)
+        if r.status_code == 429 and 'limit": 0' in r.text:  # this project has no free quota for this model
+            raise ModelNotFound(f"{model}: no free quota ({r.text[:160]})")
+        wait = 5
+        if r.status_code == 429:
+            m = re.search(r'retryDelay"?\s*:\s*"?(\d+)', r.text)
+            wait = min(int(m.group(1)) + 2, 70) if m else 15
+            if attempt < len(GEMINI_KEYS) - 1:  # other keys are still fresh: switch quickly
+                wait = 2
+        elif r.status_code not in (500, 503):
+            wait = 1
+        time.sleep(wait)
     raise RuntimeError(f"Gemini ({model}) failed: " + str(last))
 
 
@@ -204,7 +215,7 @@ def groq_llm(prompt, json_mode=True):
     if json_mode:
         body["response_format"] = {"type": "json_object"}
     last = None
-    for a in range(3):
+    for a in range(4):
         r = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers={"Authorization": f"Bearer {key}"}, json=body, timeout=180,
@@ -212,16 +223,42 @@ def groq_llm(prompt, json_mode=True):
         if r.status_code == 200:
             return r.json()["choices"][0]["message"]["content"]
         last = f"{r.status_code} {r.text[:200]}"
+        if r.status_code == 413:  # over Groq's tokens-per-minute limit: shrink the prompt and retry
+            m = re.search(r"Limit (\d+), Requested (\d+)", r.text)
+            ratio = int(m.group(1)) / int(m.group(2)) * 0.75 if m else 0.6
+            prompt = shrink_prompt(prompt, ratio)
+            body["messages"][0]["content"] = prompt
+            log(f"Groq 413: shrinking prompt to {len(prompt)} chars and retrying")
+            continue
         time.sleep(10 * (a + 1))
     raise RuntimeError("Groq LLM failed: " + str(last))
 
 
+def shrink_prompt(prompt, ratio):
+    """Emergency trim for the Groq fallback: keep the start (instructions) and the end (output format)."""
+    n = max(2000, int(len(prompt) * ratio))
+    head = int(n * 0.65)
+    return prompt[:head] + "\n...[trimmed to fit the model limit]...\n" + prompt[-(n - head):]
+
+
 def llm(prompt, json_mode=True):
+    err = None
+    # Gemini 503 ("high demand") and 429 are usually temporary: wait and retry before using the weaker Groq fallback.
+    for rnd in range(3):
+        try:
+            return gemini(prompt, json_mode)
+        except Exception as e:
+            err = e
+            log(f"Gemini round {rnd + 1}/3 failed: {str(e)[:400]}")
+            if not GEMINI_KEYS:
+                break
+            if rnd < 2:
+                time.sleep(40 * (rnd + 1))
+    log("Gemini unavailable; falling back to Groq")
     try:
-        return gemini(prompt, json_mode)
-    except Exception as e:
-        log(f"Gemini failed ({e}); falling back to Groq")
         return groq_llm(prompt, json_mode)
+    except Exception as e2:
+        raise RuntimeError(f"Gemini: {str(err)[:380]} || Groq: {str(e2)[:380]}")
 
 
 def parse_json(text):
@@ -431,7 +468,7 @@ def transcript_ytdlp_subs(url):
     for attempt in range(3):
         try:
             ytdlp(["--skip-download", "--ignore-no-formats-error", "--write-subs", "--write-auto-subs",
-                   "--sub-langs", "hi.*,en.*",
+                   "--sub-langs", "hi-orig,hi,en-orig,en", "--sleep-subtitles", "2",
                    "--sub-format", "vtt", "-o", str(WORK / "subs.%(ext)s"), url])
             break
         except RuntimeError as e:
@@ -441,7 +478,13 @@ def transcript_ytdlp_subs(url):
                 time.sleep(wait)
                 continue
             raise
-    files = sorted(WORK.glob("subs.*.vtt"), key=lambda p: (".hi" not in p.name, ".en" not in p.name, p.name))
+    order = ["hi-orig", "hi", "en-orig", "en"]
+
+    def rank(p):
+        lang = p.name[len("subs."):-len(".vtt")]
+        return order.index(lang) if lang in order else 99
+
+    files = sorted(WORK.glob("subs.*.vtt"), key=rank)
     if not files:
         raise RuntimeError("no subtitle files downloaded")
     return vtt_to_text(files[0].read_text(encoding="utf-8", errors="ignore"))
@@ -513,7 +556,7 @@ def make_notes(text):
         p = (f"This is section {i} of {len(chunks)} of a podcast transcript. Extract the key points as 8-12 concise "
              f"English bullet points. Keep names, numbers and examples. Output only the bullets.\n\nTRANSCRIPT:\n{c}")
         notes.append(f"[Section {i}]\n" + llm(p, json_mode=False).strip())
-        time.sleep(2)
+        time.sleep(6)  # stay under the free-tier requests-per-minute limit
     return "\n\n".join(notes)
 
 

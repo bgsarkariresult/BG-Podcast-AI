@@ -1,0 +1,8 @@
+requests
+edge-tts
+youtube-transcript-api
+yt-dlp[default]
+Pillow
+google-api-python-client
+google-auth
+google-auth-httplib2

@@ -27,9 +27,12 @@ import requests
 WORK = Path("work")
 DONE_FILE = Path("done.json")
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-GROQ_LLM = os.getenv("GROQ_LLM_MODEL", "llama-3.3-70b-versatile")
-GROQ_STT = os.getenv("GROQ_STT_MODEL", "whisper-large-v3-turbo")
+# Comma-separated list, tried in order; a model that returns 404 (retired) is skipped automatically.
+GEMINI_MODELS = [m.strip() for m in (os.getenv("GEMINI_MODEL") or "gemini-3.6-flash,gemini-3.8-flash").split(",")
+                 if m.strip()]
+# Groq model names change often; leave these unset to auto-pick from Groq's live model list.
+GROQ_LLM = os.getenv("GROQ_LLM_MODEL") or ""
+GROQ_STT = os.getenv("GROQ_STT_MODEL") or ""
 VOICE = os.getenv("TTS_VOICE", "hi-IN-MadhurNeural")
 TTS_RATE = os.getenv("TTS_RATE", "+0%")
 WORDS_PER_PART = int(os.getenv("WORDS_PER_PART", "900"))  # ~6 min of Hindi speech
@@ -97,7 +100,11 @@ def run_url():
 
 
 # ------------------------------------------------------------------ LLM layer
-def gemini(prompt, json_mode=True):
+class ModelNotFound(Exception):
+    pass
+
+
+def _gemini_one(prompt, json_mode, model):
     """Round-robin over all Gemini keys; rotate to the next key on any failure."""
     global _key_i
     if not GEMINI_KEYS:
@@ -110,7 +117,7 @@ def gemini(prompt, json_mode=True):
             body["generationConfig"]["responseMimeType"] = "application/json"
         try:
             r = requests.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
                 params={"key": key}, json=body, timeout=180,
             )
         except requests.RequestException as e:
@@ -126,15 +133,73 @@ def gemini(prompt, json_mode=True):
                 last = "empty response: " + r.text[:200]
                 continue
         last = f"{r.status_code} {r.text[:200]}"
+        if r.status_code == 404:
+            raise ModelNotFound(f"{model}: {r.text[:200]}")
         time.sleep(5 if r.status_code in (429, 500, 503) else 1)
-    raise RuntimeError("Gemini failed: " + str(last))
+    raise RuntimeError(f"Gemini ({model}) failed: " + str(last))
+
+
+def gemini(prompt, json_mode=True):
+    if not GEMINI_KEYS:
+        raise RuntimeError("no Gemini keys set")
+    last = None
+    for model in GEMINI_MODELS:
+        try:
+            return _gemini_one(prompt, json_mode, model)
+        except ModelNotFound as e:
+            log(f"Gemini model not available, trying next: {str(e)[:160]}")
+            last = e
+        except RuntimeError as e:
+            last = e
+    raise RuntimeError(f"Gemini failed on all models {GEMINI_MODELS}: {last}")
+
+
+_GROQ_MODELS = None
+
+
+def groq_models():
+    global _GROQ_MODELS
+    if _GROQ_MODELS is None:
+        _GROQ_MODELS = []
+        try:
+            r = requests.get("https://api.groq.com/openai/v1/models",
+                             headers={"Authorization": f"Bearer {os.getenv('GROQ_API_KEY')}"}, timeout=30)
+            if r.status_code == 200:
+                _GROQ_MODELS = [m["id"] for m in r.json().get("data", [])]
+        except Exception as e:
+            log(f"could not list Groq models: {e}")
+        log(f"Groq models available: {_GROQ_MODELS}")
+    return _GROQ_MODELS
+
+
+def groq_llm_model():
+    if GROQ_LLM:
+        return GROQ_LLM
+    bad = ("whisper", "tts", "guard", "orpheus", "playai", "embed", "safeguard")
+    ids = [m for m in groq_models() if not any(b in m.lower() for b in bad)]
+    for pat in ("llama-3.3-70b", "70b", "gpt-oss-120b", "llama", "qwen", "gpt-oss"):
+        for m in ids:
+            if pat in m.lower():
+                return m
+    return ids[0] if ids else "llama-3.3-70b-versatile"
+
+
+def groq_stt_model():
+    if GROQ_STT:
+        return GROQ_STT
+    ids = [m for m in groq_models() if "whisper" in m.lower()]
+    for pat in ("large-v3-turbo", "large-v3", "whisper"):
+        for m in ids:
+            if pat in m.lower():
+                return m
+    return ids[0] if ids else "whisper-large-v3-turbo"
 
 
 def groq_llm(prompt, json_mode=True):
     key = os.getenv("GROQ_API_KEY")
     if not key:
         raise RuntimeError("GROQ_API_KEY missing")
-    body = {"model": GROQ_LLM, "messages": [{"role": "user", "content": prompt}], "temperature": 0.7}
+    body = {"model": groq_llm_model(), "messages": [{"role": "user", "content": prompt}], "temperature": 0.7}
     if json_mode:
         body["response_format"] = {"type": "json_object"}
     last = None
@@ -317,7 +382,7 @@ def transcript_whisper(url):
                     "https://api.groq.com/openai/v1/audio/transcriptions",
                     headers={"Authorization": f"Bearer {key}"},
                     files={"file": (seg.name, f, "audio/mpeg")},
-                    data={"model": GROQ_STT, "response_format": "json"},
+                    data={"model": groq_stt_model(), "response_format": "json"},
                     timeout=300,
                 )
             if r.status_code == 200:
@@ -385,7 +450,8 @@ def get_text(url, vid):
 
 
 def make_notes(text):
-    chunks = [text[i:i + 14000] for i in range(0, len(text), 14000)]
+    size = 30000 if GEMINI_KEYS else 9000  # Gemini takes big chunks; Groq's free limits need small ones
+    chunks = [text[i:i + size] for i in range(0, len(text), size)]
     if len(chunks) == 1:
         return text
     notes = []

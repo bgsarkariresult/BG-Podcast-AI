@@ -190,6 +190,7 @@ def ytdlp(args):
     p = subprocess.run(base + js_args() + args, capture_output=True, text=True)
     if p.returncode == 0:
         return p.stdout
+    log("---- yt-dlp stderr (tail) ----\n" + p.stderr[-2500:] + "\n---- end ----")
     lines = [ln.strip() for ln in p.stderr.splitlines()]
     errs = [ln for ln in lines if ln.startswith("ERROR")]
     warns = [ln for ln in lines if ln.startswith("WARNING") or "cookie" in ln.lower()]
@@ -209,6 +210,8 @@ def js_args():
             helptext = subprocess.run(["yt-dlp", "--help"], capture_output=True, text=True).stdout
             if "--js-runtimes" in helptext:
                 _JS_ARGS = ["--js-runtimes", "node"]
+                if "--remote-components" in helptext:  # lets yt-dlp fetch the n-challenge solver if needed
+                    _JS_ARGS += ["--remote-components", "ejs:github"]
         log(f"yt-dlp JS runtime args: {_JS_ARGS or 'NONE'} (node at {node})")
     return _JS_ARGS
 
@@ -265,7 +268,7 @@ def extract_id(url):
 
 def get_meta(url, vid):
     try:
-        info = json.loads(ytdlp(["--dump-single-json", "--skip-download", url]))
+        info = json.loads(ytdlp(["--dump-single-json", "--skip-download", "--ignore-no-formats-error", url]))
         return {
             "title": info.get("title") or "Podcast",
             "channel": info.get("uploader") or info.get("channel") or "",
@@ -342,7 +345,8 @@ def vtt_to_text(raw):
 
 
 def transcript_ytdlp_subs(url):
-    ytdlp(["--skip-download", "--write-subs", "--write-auto-subs", "--sub-langs", "hi.*,en.*",
+    ytdlp(["--skip-download", "--ignore-no-formats-error", "--write-subs", "--write-auto-subs",
+           "--sub-langs", "hi.*,en.*",
            "--sub-format", "vtt", "-o", str(WORK / "subs.%(ext)s"), url])
     files = sorted(WORK.glob("subs.*.vtt"), key=lambda p: (".hi" not in p.name, ".en" not in p.name, p.name))
     if not files:
@@ -371,10 +375,13 @@ def get_text(url, vid):
     elif not COOKIES_LOGGED_IN:
         hint = ("\n\ncookies.txt में लॉगिन वाली cookies नहीं हैं (सिर्फ़ अनाम cookies)। "
                 "नए Google अकाउंट से इन्कॉग्निटो में लॉगिन करके नई cookies एक्सपोर्ट करें।")
-    else:
-        hint = ("\n\ncookies लॉगिन वाली हैं, फिर भी YouTube रोक रहा है: cookies पुरानी/अमान्य हो सकती हैं "
+    elif any("Sign in to confirm" in e for e in errors[1:]):
+        hint = ("\n\ncookies लॉगिन वाली हैं, फिर भी YouTube बॉट-जाँच लगा रहा है: cookies पुरानी/अमान्य हो सकती हैं "
                 "(नई निकालें) या GitHub का IP सख़्ती से ब्लॉक है (तब self-hosted runner चाहिए)।")
-    raise RuntimeError("transcript नहीं मिला। " + " | ".join(errors) + hint)
+    else:
+        hint = ("\n\nbॉट-ब्लॉक का एरर नहीं है। yt-dlp को वीडियो के format नहीं मिले "
+                "(JS challenge solver की दिक्कत)। पूरा लॉग देखें।")
+    raise RuntimeError("transcript नहीं मिला।" + hint + "\n\n" + " | ".join(errors))
 
 
 def make_notes(text):
@@ -833,5 +840,5 @@ if __name__ == "__main__":
         main()
     except Exception as exc:
         traceback.print_exc()
-        tg(f"❌ Podcast bot फेल हुआ\n{os.getenv('VIDEO_URL', '')}\n\n{type(exc).__name__}: {str(exc)[-700:]}\n{run_url()}")
+        tg(f"❌ Podcast bot फेल हुआ\n{os.getenv('VIDEO_URL', '')}\n\n{type(exc).__name__}: {str(exc)[:900]}\n{run_url()}")
         sys.exit(1)

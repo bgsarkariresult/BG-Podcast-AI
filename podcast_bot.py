@@ -828,13 +828,29 @@ def outline_prompt(meta, notes, n):
         "Return JSON only, in this shape:\n"
         '{"video_title_hi": "...", "description_hi": "...", "tags": ["..."], '
         '"parts": [{"part": 1, "title_hi": "...", "thumb_text": "...", "focus": "...", "points": ["..."]}]}\n'
-        "Rules: titles in Devanagari Hindi, catchy but truthful, max 70 characters. description_hi is 3-5 lines of Hindi. "
+        "Rules: titles are in easy everyday Hinglish written in Devanagari script (simple words people use daily, "
+        "English words like 'पॉडकास्ट', 'इंडिया', 'मनी' are fine; no heavy Sanskritized Hindi), catchy but truthful, "
+        "max 70 characters. description_hi is 3-5 lines in the same easy Hinglish (Devanagari). "
         "10-15 tags (mix Hindi and English). thumb_text is 2-4 ENGLISH words. points are 6-12 English bullets per part "
         "listing exactly what that part covers."
     )
 
 
-def script_prompt(meta, notes, k, n, part):
+STYLE_HINGLISH = (
+    "LANGUAGE STYLE (very important): write in easy, everyday Hinglish, the way a friendly YouTuber talks - simple "
+    "Hindi sentences mixed with common English words - but ALWAYS in Devanagari script. Use the English words people "
+    "really use in daily talk (written in Devanagari) instead of heavy or formal Hindi. Examples: 'मेन पॉइंट' not "
+    "'मुख्य बिंदु'; 'स्पीड' not 'रफ़्तार'; 'टॉपिक' not 'विषय'; 'प्रॉब्लम' not 'समस्या'; 'आइडिया' not 'विचार'; "
+    "'इकोनॉमी' not 'अर्थव्यवस्था'; 'रिलेशनशिप' not 'संबंध'; 'सक्सेस' not 'सफलता'; 'इंपॉर्टेंट' not 'महत्वपूर्ण'. "
+    "Avoid difficult Sanskritized words (अत्यंत, तत्पश्चात, परंतु, किंतु, अतः, इत्यादि); say 'बहुत', 'फिर', 'लेकिन', "
+    "'इसलिए' instead. Keep sentences short and clear so a common viewer understands on the first listen. "
+    "Write EVERY English word, and names of people, countries and brands, in Devanagari as they are pronounced "
+    "(e.g. 'इंडिया', 'चाइना', 'पॉडकास्ट'). Do NOT use Roman/Latin letters inside the 'hi' field."
+)
+
+
+def script_prompt(meta, notes, k, n, part, words=None):
+    words = words or WORDS_PER_PART
     if n == 1:
         role = ("Start with a strong hook. Within the first segments mention that this is a summary of the podcast "
                 f"\"{meta['title']}\" from {meta['channel']} and invite viewers to watch the original. "
@@ -855,11 +871,13 @@ def script_prompt(meta, notes, k, n, part):
         "This part's key points:\n- " + "\n- ".join(part.get("points", [])) + "\n\n"
         f"Source material (use it only for facts about this part's focus):\n{notes}\n\n"
         "Rules:\n"
-        f"- About {WORDS_PER_PART} words of Hindi (Devanagari), simple spoken style, no markdown.\n"
+        f"- At least {words} words in total (a longer, complete explanation is fine; do not rush or skip important points).\n"
         "- Split into short segments of 1-2 sentences (max 30 words each).\n"
-        "- Each segment has \"hi\" (Devanagari) and \"en\" (accurate, natural English translation of that same segment).\n"
+        "- Each segment has \"hi\" (easy Hinglish in Devanagari) and \"en\" (accurate, natural English translation "
+        "of that same segment, in plain English).\n"
         f"- {role}\n"
-        "- Do not invent facts that are not in the source. Brand and person names may stay in Latin letters.\n"
+        "- Do not invent facts that are not in the source.\n"
+        f"- {STYLE_HINGLISH}\n"
         'Return JSON only: {"segments": [{"hi": "...", "en": "..."}]}'
     )
 
@@ -912,14 +930,21 @@ def main():
     for k in range(1, n_parts + 1):
         part = parts[k - 1]
         log(f"--- part {k}/{n_parts}: {part.get('title_hi')}")
-        script = llm_json(script_prompt(meta, notes, k, n_parts, part))
-        segs = [s for s in script.get("segments", []) if (s.get("hi") or "").strip()]
-        if len(segs) < 5:
-            raise RuntimeError(f"part {k}: script too short ({len(segs)} segments)")
-
         pdir = WORK / f"part{k}"
         pdir.mkdir()
-        _, timeline, total = build_audio(segs, pdir)
+        words = WORDS_PER_PART
+        for attempt in range(2):
+            script = llm_json(script_prompt(meta, notes, k, n_parts, part, words))
+            segs = [s for s in script.get("segments", []) if (s.get("hi") or "").strip()]
+            if len(segs) < 5:
+                raise RuntimeError(f"part {k}: script too short ({len(segs)} segments)")
+            _, timeline, total = build_audio(segs, pdir)
+            # Long parts are fine; only a part that is too SHORT gets one retry with a bigger word target.
+            if total >= MIN_PART_SEC or attempt == 1:
+                break
+            words = int(words * max(1.3, MIN_PART_SEC * 1.15 / total))
+            log(f"part {k} is only {total / 60:.1f} min (< {MIN_PART_SEC / 60:.0f} min); "
+                f"regenerating with ~{words} words")
         build_srt(segs, timeline, pdir / "cap.srt")
         video = build_video(clips, pdir, total, offset=(k - 1) * 3)
         log(f"part {k} video: {total / 60:.1f} min")
@@ -940,7 +965,8 @@ def main():
             publish_at = (datetime.now(timezone.utc) + timedelta(hours=delay_h * (k - 1))).strftime(
                 "%Y-%m-%dT%H:%M:%S.000Z")
         yid = upload(yt, video, title, desc, plan.get("tags", []), privacy, publish_at, thumb)
-        results.append({"part": k, "id": yid, "title": title, "scheduled": publish_at})
+        results.append({"part": k, "id": yid, "title": title, "scheduled": publish_at,
+                        "minutes": round(total / 60, 1)})
         log(f"uploaded: https://youtu.be/{yid}")
         shutil.rmtree(pdir, ignore_errors=True)  # free disk
 
@@ -951,7 +977,7 @@ def main():
     lines = [f"✅ Podcast summary तैयार: {meta['title']}"]
     for r in results:
         extra = f" (शेड्यूल: {r['scheduled']})" if r["scheduled"] else ""
-        lines.append(f"भाग {r['part']}: https://youtu.be/{r['id']}{extra}")
+        lines.append(f"भाग {r['part']} ({r['minutes']} मिनट): https://youtu.be/{r['id']}{extra}")
     tg("\n".join(lines))
 
 

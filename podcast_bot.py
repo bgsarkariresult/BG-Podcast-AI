@@ -65,14 +65,21 @@ def tg(msg):
     tok, chat = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
     if not tok or not chat:
         return
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{tok}/sendMessage",
-            data={"chat_id": chat, "text": msg[:3900], "disable_web_page_preview": True},
-            timeout=30,
-        )
-    except Exception as e:  # never let alerts crash the bot
-        log(f"telegram failed: {e}")
+    for attempt in range(3):  # retry: Telegram sometimes times out from cloud runners
+        try:
+            r = requests.post(
+                f"https://api.telegram.org/bot{tok}/sendMessage",
+                data={"chat_id": chat, "text": msg[:3900], "disable_web_page_preview": True},
+                timeout=20,
+            )
+            if r.status_code == 200:
+                return
+            log(f"telegram HTTP {r.status_code}: {r.text[:150]}")
+            if r.status_code in (400, 401, 403, 404):
+                return  # wrong token / chat id: retrying will not help
+        except Exception as e:  # never let alerts crash the bot
+            log(f"telegram failed (try {attempt + 1}): {e}")
+        time.sleep(3 * (attempt + 1))
 
 
 def run_url():
@@ -257,19 +264,49 @@ def transcript_whisper(url):
     return " ".join(texts)
 
 
+def vtt_to_text(raw):
+    import html
+    out, prev = [], ""
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or "-->" in line or line.startswith(("WEBVTT", "Kind:", "Language:", "NOTE")):
+            continue
+        line = html.unescape(re.sub(r"<[^>]+>", "", line)).strip()
+        if line and line != prev:  # auto-captions repeat rolling lines
+            out.append(line)
+            prev = line
+    return " ".join(out)
+
+
+def transcript_ytdlp_subs(url):
+    ytdlp(["--skip-download", "--write-subs", "--write-auto-subs", "--sub-langs", "hi.*,en.*",
+           "--sub-format", "vtt", "-o", str(WORK / "subs.%(ext)s"), url])
+    files = sorted(WORK.glob("subs.*.vtt"), key=lambda p: (".hi" not in p.name, ".en" not in p.name, p.name))
+    if not files:
+        raise RuntimeError("no subtitle files downloaded")
+    return vtt_to_text(files[0].read_text(encoding="utf-8", errors="ignore"))
+
+
 def get_text(url, vid):
-    try:
-        t = transcript_api(vid)
-        if len(t) > 500:
-            log(f"transcript from YouTube captions: {len(t)} chars")
-            return t
-    except Exception as e:
-        log(f"caption transcript failed: {e}")
-    log("falling back to Groq Whisper")
-    t = transcript_whisper(url)
-    if len(t) < 500:
-        raise RuntimeError("transcript too short / empty")
-    return t
+    errors = []
+    for name, fn in (("YouTube transcript API", lambda: transcript_api(vid)),
+                     ("yt-dlp subtitles", lambda: transcript_ytdlp_subs(url)),
+                     ("Groq Whisper", lambda: transcript_whisper(url))):
+        try:
+            log(f"trying transcript source: {name}")
+            t = fn()
+            if len(t) > 500:
+                log(f"transcript OK via {name}: {len(t)} chars")
+                return t
+            errors.append(f"{name}: too short")
+        except Exception as e:
+            log(f"{name} failed: {str(e)[:300]}")
+            errors.append(f"{name}: {str(e)[:120]}")
+    hint = ""
+    if not Path("cookies.txt").exists():
+        hint = ("\n\nYouTube ने GitHub का IP ब्लॉक किया है। रेपो में YT_COOKIES secret जोड़ें "
+                "(cookies.txt का पूरा कंटेंट) और दोबारा चलाएँ।")
+    raise RuntimeError("transcript नहीं मिला। " + " | ".join(errors) + hint)
 
 
 def make_notes(text):

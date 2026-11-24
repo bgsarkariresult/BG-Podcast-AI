@@ -36,6 +36,7 @@ GROQ_STT = os.getenv("GROQ_STT_MODEL") or ""
 VOICE = os.getenv("TTS_VOICE", "hi-IN-MadhurNeural")
 TTS_RATE = os.getenv("TTS_RATE", "+0%")
 WORDS_PER_PART = int(os.getenv("WORDS_PER_PART", "900"))  # ~6 min of Hindi speech
+MIN_PART_SEC = int(os.getenv("MIN_PART_SEC", "240"))  # a part shorter than this is regenerated once (long is fine)
 
 W, H, FPS = 1280, 720, 25
 SEC_PER_IMG = 8
@@ -370,28 +371,45 @@ def transcript_whisper(url):
     ytdlp(["-f", "bestaudio/best", "-o", str(WORK / "audio_src.%(ext)s"), url])
     src = next(WORK.glob("audio_src.*"))
     run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(src), "-ac", "1", "-ar", "16000", "-b:a", "32k",
-         "-f", "segment", "-segment_time", "600", "-reset_timestamps", "1", str(WORK / "aseg_%03d.mp3")])
+         "-f", "segment", "-segment_time", "300", "-reset_timestamps", "1", str(WORK / "aseg_%03d.mp3")])
     key = os.getenv("GROQ_API_KEY")
     if not key:
         raise RuntimeError("GROQ_API_KEY missing for Whisper fallback")
+    segs = sorted(WORK.glob("aseg_*.mp3"))
+    lang = os.getenv("WHISPER_LANG") or ""  # optional language hint, e.g. "hi" or "en"
     texts = []
-    for seg in sorted(WORK.glob("aseg_*.mp3")):
-        for attempt in range(4):
+    for seg in segs:
+        text = ""
+        for attempt in range(6):
+            data = {"model": groq_stt_model(), "response_format": "json", "temperature": "0"}
+            if lang:
+                data["language"] = lang
             with open(seg, "rb") as f:
                 r = requests.post(
                     "https://api.groq.com/openai/v1/audio/transcriptions",
                     headers={"Authorization": f"Bearer {key}"},
                     files={"file": (seg.name, f, "audio/mpeg")},
-                    data={"model": groq_stt_model(), "response_format": "json"},
-                    timeout=300,
+                    data=data, timeout=300,
                 )
             if r.status_code == 200:
-                texts.append(r.json().get("text", ""))
+                text = r.json().get("text", "")
+                if len(text) < 150 and attempt == 0:  # near-empty 5-min chunk: try once more
+                    log(f"whisper {seg.name}: only {len(text)} chars, retrying once")
+                    continue
                 break
             log(f"whisper {seg.name}: {r.status_code} {r.text[:150]}")
-            time.sleep(20 * (attempt + 1))
+            try:  # honour Groq's rate-limit wait time (free tier has an audio-seconds-per-hour cap)
+                wait = int(float(r.headers.get("retry-after", ""))) + 2
+            except ValueError:
+                wait = 20 * (attempt + 1)
+            time.sleep(min(wait, 600))
         else:
             raise RuntimeError(f"Whisper failed for {seg.name}")
+        texts.append(text)
+        log(f"whisper {seg.name}: {len(text)} chars")
+    total = sum(len(t) for t in texts)
+    log(f"whisper total: {total} chars for ~{len(segs) * 5} min of audio "
+        f"(~{total // max(1, len(segs) * 5)} chars/min)")
     return " ".join(texts)
 
 
@@ -410,16 +428,51 @@ def vtt_to_text(raw):
 
 
 def transcript_ytdlp_subs(url):
-    ytdlp(["--skip-download", "--ignore-no-formats-error", "--write-subs", "--write-auto-subs",
-           "--sub-langs", "hi.*,en.*",
-           "--sub-format", "vtt", "-o", str(WORK / "subs.%(ext)s"), url])
+    for attempt in range(3):
+        try:
+            ytdlp(["--skip-download", "--ignore-no-formats-error", "--write-subs", "--write-auto-subs",
+                   "--sub-langs", "hi.*,en.*",
+                   "--sub-format", "vtt", "-o", str(WORK / "subs.%(ext)s"), url])
+            break
+        except RuntimeError as e:
+            if "429" in str(e) and attempt < 2:  # YouTube rate limit: wait and retry
+                wait = 45 * (attempt + 1)
+                log(f"subtitles got 429, waiting {wait}s before retry {attempt + 2}/3")
+                time.sleep(wait)
+                continue
+            raise
     files = sorted(WORK.glob("subs.*.vtt"), key=lambda p: (".hi" not in p.name, ".en" not in p.name, p.name))
     if not files:
         raise RuntimeError("no subtitle files downloaded")
     return vtt_to_text(files[0].read_text(encoding="utf-8", errors="ignore"))
 
 
-def get_text(url, vid):
+CACHE_DIR = Path("cache")
+
+
+def cache_get(vid):
+    p = CACHE_DIR / f"{vid}.txt"
+    if p.exists():
+        t = p.read_text(encoding="utf-8", errors="ignore")
+        if len(t) > 2000:
+            return t
+    return None
+
+
+def cache_put(vid, text):
+    try:
+        CACHE_DIR.mkdir(exist_ok=True)
+        (CACHE_DIR / f"{vid}.txt").write_text(text, encoding="utf-8")
+    except OSError as e:
+        log(f"could not write transcript cache: {e}")
+
+
+def get_text(url, vid, force=False):
+    if not force:
+        cached = cache_get(vid)
+        if cached:
+            log(f"transcript from cache: {len(cached)} chars (use force=true to fetch again)")
+            return cached
     errors = []
     for name, fn in (("YouTube transcript API", lambda: transcript_api(vid)),
                      ("yt-dlp subtitles", lambda: transcript_ytdlp_subs(url)),
@@ -429,6 +482,7 @@ def get_text(url, vid):
             t = fn()
             if len(t) > 500:
                 log(f"transcript OK via {name}: {len(t)} chars")
+                cache_put(vid, t)
                 return t
             errors.append(f"{name}: too short")
         except Exception as e:
@@ -841,7 +895,7 @@ def main():
     log(f"podcast: {meta['title']} | {meta['channel']} | {meta['duration']}s")
     tg(f"▶️ Podcast summary शुरू: {meta['title']}\n{run_url()}")
 
-    text = get_text(url, vid)
+    text = get_text(url, vid, force)
     notes = make_notes(text)
 
     plan = llm_json(outline_prompt(meta, notes, n_parts))

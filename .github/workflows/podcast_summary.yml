@@ -16,7 +16,7 @@ on:
       privacy:
         description: "Upload privacy"
         required: false
-        default: "public"
+        default: "unlisted"
         type: choice
         options: ["public", "unlisted", "private"]
       part2_delay_hours:

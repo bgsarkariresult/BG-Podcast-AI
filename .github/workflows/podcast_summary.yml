@@ -1,0 +1,93 @@
+name: Podcast Summary Bot
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: "YouTube podcast link"
+        required: true
+        type: string
+      parts:
+        description: "Kitne part me video banana hai"
+        required: false
+        default: "2"
+        type: choice
+        options: ["1", "2", "3"]
+      privacy:
+        description: "Upload privacy"
+        required: false
+        default: "public"
+        type: choice
+        options: ["public", "unlisted", "private"]
+      part2_delay_hours:
+        description: "Part 2 (aur 3) kitne ghante baad publish ho (0 = turant)"
+        required: false
+        default: "0"
+        type: string
+      force:
+        description: "Pehle ban chuka video dobara banao"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: podcast-summary
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install ffmpeg and fonts
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg fonts-dejavu-core
+
+      - name: Install Python packages
+        run: pip install -r requirements.txt
+
+      - name: Write YouTube cookies (optional)
+        env:
+          YT_COOKIES: ${{ secrets.YT_COOKIES }}
+        run: |
+          if [ -n "$YT_COOKIES" ]; then printf '%s' "$YT_COOKIES" > cookies.txt; fi
+
+      - name: Run podcast bot
+        env:
+          VIDEO_URL: ${{ inputs.video_url }}
+          NUM_PARTS: ${{ inputs.parts }}
+          PRIVACY: ${{ inputs.privacy }}
+          PART2_DELAY_HOURS: ${{ inputs.part2_delay_hours }}
+          FORCE: ${{ inputs.force }}
+          GEMINI_API_KEY_1: ${{ secrets.GEMINI_API_KEY_1 }}
+          GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
+          GEMINI_API_KEY_3: ${{ secrets.GEMINI_API_KEY_3 }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+          YT_PLAYLIST_ID: ${{ secrets.YT_PLAYLIST_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python podcast_bot.py
+
+      - name: Save done list
+        if: success()
+        run: |
+          git config user.name "podcast-bot"
+          git config user.email "podcast-bot@users.noreply.github.com"
+          git add done.json || true
+          git diff --cached --quiet || (git commit -m "podcast done list" && git push)

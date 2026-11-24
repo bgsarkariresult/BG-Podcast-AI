@@ -187,19 +187,33 @@ def ytdlp(args):
     base = ["yt-dlp", "--no-playlist"]
     if Path("cookies.txt").exists():
         base += ["--cookies", "cookies.txt"]
-    err = ""
-    for extra in (["--js-runtimes", "node"], []):
-        p = subprocess.run(base + extra + args, capture_output=True, text=True)
-        if p.returncode == 0:
-            return p.stdout
-        err = p.stderr
-        low = err.lower()
-        if extra and ("no such option" in low or "unrecognized" in low):
-            continue  # old yt-dlp without --js-runtimes
-        break
-    keep = [ln.strip() for ln in err.splitlines()
-            if ln.startswith(("ERROR", "WARNING")) or "cookie" in ln.lower()]
-    raise RuntimeError("yt-dlp failed: " + (" || ".join(keep) or err)[:900])
+    p = subprocess.run(base + js_args() + args, capture_output=True, text=True)
+    if p.returncode == 0:
+        return p.stdout
+    lines = [ln.strip() for ln in p.stderr.splitlines()]
+    errs = [ln for ln in lines if ln.startswith("ERROR")]
+    warns = [ln for ln in lines if ln.startswith("WARNING") or "cookie" in ln.lower()]
+    raise RuntimeError("yt-dlp failed: " + " || ".join(errs + warns)[:1200])
+
+
+_JS_ARGS = None
+
+
+def js_args():
+    """YouTube needs a JavaScript runtime; yt-dlp only auto-enables deno, so pass node explicitly."""
+    global _JS_ARGS
+    if _JS_ARGS is None:
+        _JS_ARGS = []
+        node = shutil.which("node")
+        if node:
+            helptext = subprocess.run(["yt-dlp", "--help"], capture_output=True, text=True).stdout
+            if "--js-runtimes" in helptext:
+                _JS_ARGS = ["--js-runtimes", "node"]
+        log(f"yt-dlp JS runtime args: {_JS_ARGS or 'NONE'} (node at {node})")
+    return _JS_ARGS
+
+
+COOKIES_LOGGED_IN = False
 
 
 def cookie_report():
@@ -233,6 +247,11 @@ def cookie_report():
     log(f"cookies.txt: {len(names)} cookies, domains={sorted(doms)[:6]}, repaired_lines={fixed}, bad_lines={bad}")
     log("cookies.txt login cookies present: " + ", ".join(k for k in keys if k in names) +
         " | missing: " + ", ".join(k for k in keys if k not in names))
+    log("cookie names in file: " + ", ".join(sorted(names)))
+    global COOKIES_LOGGED_IN
+    COOKIES_LOGGED_IN = any(k in names for k in keys)
+    if not COOKIES_LOGGED_IN:
+        log("WARNING: cookies.txt has NO login cookies -> these are anonymous cookies, YouTube will still block")
 
 
 def extract_id(url):
@@ -344,12 +363,17 @@ def get_text(url, vid):
                 return t
             errors.append(f"{name}: too short")
         except Exception as e:
-            log(f"{name} failed: {str(e)[:300]}")
-            errors.append(f"{name}: {str(e)[:120]}")
-    hint = ""
+            log(f"{name} failed: {str(e)[:600]}")
+            errors.append(f"{name}: {str(e)[:220]}")
     if not Path("cookies.txt").exists():
         hint = ("\n\nYouTube ने GitHub का IP ब्लॉक किया है। रेपो में YT_COOKIES secret जोड़ें "
                 "(cookies.txt का पूरा कंटेंट) और दोबारा चलाएँ।")
+    elif not COOKIES_LOGGED_IN:
+        hint = ("\n\ncookies.txt में लॉगिन वाली cookies नहीं हैं (सिर्फ़ अनाम cookies)। "
+                "नए Google अकाउंट से इन्कॉग्निटो में लॉगिन करके नई cookies एक्सपोर्ट करें।")
+    else:
+        hint = ("\n\ncookies लॉगिन वाली हैं, फिर भी YouTube रोक रहा है: cookies पुरानी/अमान्य हो सकती हैं "
+                "(नई निकालें) या GitHub का IP सख़्ती से ब्लॉक है (तब self-hosted runner चाहिए)।")
     raise RuntimeError("transcript नहीं मिला। " + " | ".join(errors) + hint)
 
 

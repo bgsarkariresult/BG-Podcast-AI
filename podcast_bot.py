@@ -502,15 +502,43 @@ def yt_service():
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
     from googleapiclient.discovery import build
+    info = load_yt_info()
     creds = Credentials(
         None,
-        refresh_token=os.environ["YT_REFRESH_TOKEN"],
-        token_uri="https://oauth2.googleapis.com/token",
-        client_id=os.environ["YT_CLIENT_ID"],
-        client_secret=os.environ["YT_CLIENT_SECRET"],
+        refresh_token=info["refresh_token"],
+        token_uri=info["token_uri"],
+        client_id=info["client_id"],
+        client_secret=info["client_secret"],
     )
     creds.refresh(Request())
     return build("youtube", "v3", credentials=creds)
+
+
+def load_yt_info():
+    """Accepts the full token.json (YT_TOKEN) and client_secrets.json (YT_CLIENT_SECRETS) pasted as-is,
+    or the three separate values YT_REFRESH_TOKEN / YT_CLIENT_ID / YT_CLIENT_SECRET."""
+    info = {"refresh_token": None, "client_id": None, "client_secret": None,
+            "token_uri": "https://oauth2.googleapis.com/token"}
+    tok = (os.getenv("YT_TOKEN") or "").strip()
+    if tok:
+        t = json.loads(tok)
+        for k in ("refresh_token", "client_id", "client_secret", "token_uri"):
+            info[k] = t.get(k) or info[k]
+    cs = (os.getenv("YT_CLIENT_SECRETS") or "").strip()
+    if cs:
+        c = json.loads(cs)
+        c = c.get("installed") or c.get("web") or c
+        info["client_id"] = info["client_id"] or c.get("client_id")
+        info["client_secret"] = info["client_secret"] or c.get("client_secret")
+        info["token_uri"] = c.get("token_uri") or info["token_uri"]
+    info["refresh_token"] = info["refresh_token"] or os.getenv("YT_REFRESH_TOKEN") or None
+    info["client_id"] = info["client_id"] or os.getenv("YT_CLIENT_ID") or None
+    info["client_secret"] = info["client_secret"] or os.getenv("YT_CLIENT_SECRET") or None
+    missing = [k for k in ("refresh_token", "client_id", "client_secret") if not info[k]]
+    if missing:
+        raise RuntimeError("YouTube credentials missing: " + ", ".join(missing)
+                           + " (set YT_TOKEN and YT_CLIENT_SECRETS secrets)")
+    return info
 
 
 def upload(yt, path, title, desc, tags, privacy, publish_at=None, thumb=None):

@@ -59,6 +59,14 @@ jobs:
       - name: Install Python packages
         run: pip install -r requirements.txt
 
+      - name: Restore transcript cache
+        uses: actions/cache/restore@v4
+        with:
+          path: cache
+          key: podcast-cache-${{ github.run_id }}
+          restore-keys: |
+            podcast-cache-
+
       - name: Write YouTube cookies (optional)
         env:
           YT_COOKIES: ${{ secrets.YT_COOKIES }}
@@ -93,3 +101,14 @@ jobs:
           git config user.email "podcast-bot@users.noreply.github.com"
           git add done.json || true
           git diff --cached --quiet || (git commit -m "podcast done list" && git push)
+
+      - name: Save transcript cache
+        if: always()
+        run: mkdir -p cache
+
+      - name: Upload transcript cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: cache
+          key: podcast-cache-${{ github.run_id }}

@@ -77,6 +77,13 @@ def tg(msg):
             log(f"telegram HTTP {r.status_code}: {r.text[:150]}")
             if r.status_code in (400, 401, 403, 404):
                 return  # wrong token / chat id: retrying will not help
+            if r.status_code == 429:  # rate limited: wait as long as Telegram asks
+                try:
+                    wait = int(r.json().get("parameters", {}).get("retry_after", 5))
+                except Exception:
+                    wait = 5
+                time.sleep(min(wait + 1, 40))
+                continue
         except Exception as e:  # never let alerts crash the bot
             log(f"telegram failed (try {attempt + 1}): {e}")
         time.sleep(3 * (attempt + 1))

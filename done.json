@@ -67,5 +67,26 @@
         "scheduled": null
       }
     ]
+  },
+  "Io74EB2QchY": {
+    "url": "https://youtu.be/Io74EB2QchY?si=TWOmBv7XF4IQUH2N",
+    "title": "Exposing The Dark Side Of Pakistan ft. Manoj Malhotra",
+    "date": "2026-11-25T01:40:11.379290+00:00",
+    "uploads": [
+      {
+        "part": 1,
+        "id": "ebGbdoTPuz0",
+        "title": "पाकिस्तान यात्रा का सच और लाहौर का असली माहौल | भाग 1",
+        "scheduled": null,
+        "minutes": 7.3
+      },
+      {
+        "part": 2,
+        "id": "rzxHBh63gzE",
+        "title": "नार्थ कोरिया, इरिट्रिया और अफ्रीका के अनसुने रहस्य | भाग 2",
+        "scheduled": "2026-11-25T02:40:04.000Z",
+        "minutes": 6.2
+      }
+    ]
   }
 }

@@ -721,20 +721,49 @@ def make_clips(images):
 
 
 # ------------------------------------------------------------------ audio + captions
-async def tts_all(segments, pdir):
+def _tts_clean(txt):
+    """Strip characters the voice sometimes chokes on (emoji, odd symbols, quotes)."""
+    txt = re.sub(r"[\u200b-\u200f\u2028\u2029\ufeff]", "", txt)
+    txt = re.sub(r"[\"“”‘’*_#~`<>\[\]{}|\\^@]", " ", txt)
+    txt = re.sub(r"[^\w\s.,!?;:()%&+\-/\u0900-\u097F]", " ", txt)
+    return re.sub(r"\s+", " ", txt).strip()
+
+
+async def _tts_one(text, mp3):
     import edge_tts
+    await edge_tts.Communicate(text, VOICE, rate=TTS_RATE).save(str(mp3))
+    return mp3.exists() and mp3.stat().st_size > 500
+
+
+async def tts_all(segments, pdir):
     paths = []
     for i, seg in enumerate(segments):
         mp3 = pdir / f"s{i:03d}.mp3"
-        for a in range(4):
+        text = seg["hi"]
+        ok = False
+        for a in range(6):
             try:
-                await edge_tts.Communicate(seg["hi"], VOICE, rate=TTS_RATE).save(str(mp3))
-                if mp3.exists() and mp3.stat().st_size > 500:
+                if a < 2:
+                    ok = await _tts_one(text, mp3)
+                elif a < 4:  # cleaned text
+                    ok = await _tts_one(_tts_clean(text) or text, mp3)
+                else:  # sentence by sentence, then join the mp3 pieces
+                    pieces = [p.strip() for p in re.split(r"(?<=[।.?!])\s+", _tts_clean(text)) if p.strip()]
+                    data = b""
+                    for j, p in enumerate(pieces):
+                        pm = pdir / f"s{i:03d}_{j}.mp3"
+                        if await _tts_one(p, pm):
+                            data += pm.read_bytes()
+                        pm.unlink(missing_ok=True)
+                    if len(data) > 500:
+                        mp3.write_bytes(data)
+                        ok = True
+                if ok:
                     break
             except Exception as e:
-                log(f"tts retry {a + 1} (segment {i}): {e}")
-                await asyncio.sleep(2 * (a + 1))
-        else:
+                log(f"tts retry {a + 1} (segment {i}): {str(e)[:120]}")
+            await asyncio.sleep(2 * (a + 1))
+        if not ok:
             raise RuntimeError(f"TTS failed for segment {i}")
         paths.append(mp3)
     return paths

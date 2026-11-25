@@ -770,35 +770,114 @@ def build_video(clips, pdir, total_dur, offset):
 
 
 # ------------------------------------------------------------------ thumbnail
-def make_thumb(img_path, text, out):
-    from PIL import Image, ImageDraw, ImageEnhance, ImageFont
-    im = Image.open(img_path).convert("RGB")
-    tw, th = im.size
-    target = W / H
-    if tw / th > target:
-        nw = int(th * target)
-        im = im.crop(((tw - nw) // 2, 0, (tw - nw) // 2 + nw, th))
-    else:
-        nh = int(tw / target)
-        im = im.crop((0, (th - nh) // 2, tw, (th - nh) // 2 + nh))
-    im = ImageEnhance.Brightness(im.resize((W, H))).enhance(0.7)
-    font = None
-    for fp in ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-               "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf"):
+def _thumb_font(size, bold_condensed=True):
+    from PIL import ImageFont
+    cands = []
+    if bold_condensed:
+        cands.append(str(Path(__file__).resolve().parent / "fonts" / "Anton-Regular.ttf"))
+    cands += ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+              "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf"]
+    for fp in cands:
         if Path(fp).exists():
-            font = ImageFont.truetype(fp, 120)
+            return ImageFont.truetype(fp, size)
+    return ImageFont.load_default()
+
+
+def make_thumb(img_path, text, out, part_no=1, n_parts=1):
+    """Podcast-style thumbnail: black background, the two sides of a frame as left/right
+    'guest' panels with soft edges, small yellow line, huge white title, mic + waveform,
+    white badge at the bottom."""
+    from PIL import Image, ImageDraw, ImageEnhance, ImageFilter
+    import math
+    im = Image.open(img_path).convert("RGB")
+    canvas = Image.new("RGB", (W, H), (0, 0, 0))
+
+    def side_panel(box_src, size, side):
+        crop = im.crop(box_src).resize(size, Image.LANCZOS)
+        crop = ImageEnhance.Contrast(ImageEnhance.Color(crop).enhance(1.15)).enhance(1.1)
+        mask = Image.new("L", size, 255)
+        md = ImageDraw.Draw(mask)
+        fade = int(size[0] * 0.45)
+        for x in range(fade):  # feather the inner edge into the black background
+            v = int(255 * (x / fade) ** 1.3)
+            xx = size[0] - 1 - x if side == "left" else x
+            md.line([(xx, 0), (xx, size[1])], fill=v)
+        for y in range(40):  # and the bottom edge
+            v = int(255 * (y / 40))
+            md.line([(0, size[1] - 1 - y), (size[0], size[1] - 1 - y)], fill=v, width=1)
+        return crop, mask
+
+    iw, ih = im.size
+    pw, ph = 560, H  # panel size on the canvas
+    src_h = ih
+    src_w = int(src_h * pw / ph)
+    src_w = min(src_w, iw // 2 + iw // 8)
+    # two-shot podcasts usually have one person on each side of the frame
+    lc, lm = side_panel((0, 0, src_w, src_h), (pw, ph), "left")
+    rc, rm = side_panel((iw - src_w, 0, iw, src_h), (pw, ph), "right")
+    canvas.paste(lc, (0, 0), lm)
+    canvas.paste(rc, (W - pw, 0), rm)
+    d = ImageDraw.Draw(canvas)
+
+    def centered(txt, font, y, fill, stroke=0, stroke_fill=(0, 0, 0)):
+        bb = d.textbbox((0, 0), txt, font=font, stroke_width=stroke)
+        d.text(((W - (bb[2] - bb[0])) // 2 - bb[0], y - bb[1]), txt, font=font, fill=fill,
+               stroke_width=stroke, stroke_fill=stroke_fill)
+        return bb[3] - bb[1]
+
+    # small yellow line on top
+    top = "HINDI SUMMARY" if n_parts == 1 else f"HINDI SUMMARY  |  PART {part_no}"
+    centered(top, _thumb_font(52), 70, (255, 200, 0), 3)
+
+    # huge white title (1-2 lines, shrinks to fit)
+    words = (text or "PODCAST").upper().split()
+    if len(words) > 3:
+        mid = (len(words) + 1) // 2
+        lines = [" ".join(words[:mid]), " ".join(words[mid:])]
+    elif len(words) == 3:
+        lines = [" ".join(words[:2]), words[2]]
+    else:
+        lines = [" ".join(words)]
+    size = 230 if len(lines) == 1 else 190
+    while size > 70:
+        f = _thumb_font(size)
+        if max(d.textbbox((0, 0), ln, font=f)[2] for ln in lines) <= 860:
             break
-    if font is None:
-        font = ImageFont.load_default()
-    d = ImageDraw.Draw(im)
-    words = (text or "PODCAST SUMMARY").upper().split()
-    mid = (len(words) + 1) // 2
-    lines = [" ".join(words[:mid]), " ".join(words[mid:])] if len(words) > 2 else [" ".join(words)]
-    y = H // 2 - 70 * len(lines)
+        size -= 6
+    f = _thumb_font(size)
+    y = 140
     for ln in lines:
-        d.text((60, y), ln, font=font, fill=(255, 221, 0), stroke_width=6, stroke_fill=(0, 0, 0))
-        y += 140
-    im.save(out, "JPEG", quality=90)
+        h = centered(ln, f, y, (255, 255, 255), 5)
+        y += h + 22
+
+    # mic icon + waveform
+    cy = 505
+    cx = W // 2
+    for i in range(-22, 23):
+        if i == 0 or abs(i) < 4:
+            continue
+        hgt = 14 + 52 * abs(math.sin(i * 0.9) * math.cos(i * 0.37)) * (1 - abs(i) / 30)
+        x = cx + i * 9
+        d.rounded_rectangle([x - 2, cy - hgt, x + 2, cy + hgt], 2, fill=(235, 175, 20))
+    d.rounded_rectangle([cx - 20, cy - 52, cx + 20, cy + 10], 20, outline=(255, 255, 255), width=5)
+    d.arc([cx - 38, cy - 30, cx + 38, cy + 34], 0, 180, fill=(255, 255, 255), width=5)
+    d.line([(cx, cy + 34), (cx, cy + 56)], fill=(255, 255, 255), width=5)
+    d.line([(cx - 22, cy + 56), (cx + 22, cy + 56)], fill=(255, 255, 255), width=5)
+    for k in range(-20, 21, 10):
+        d.line([(cx - 14, cy - 36 + k // 2 + 6), (cx + 14, cy - 36 + k // 2 + 6)], fill=(255, 255, 255), width=2)
+
+    # white rounded badge at the bottom
+    bw = 400
+    bx, by = (W - bw) // 2, 568
+    d.rounded_rectangle([bx, by, bx + bw, H + 40], 34, fill=(255, 255, 255))
+    if n_parts > 1:
+        l1, l2 = f"PART {part_no} OF {n_parts}", "FULL STORY"
+    else:
+        l1, l2 = "KEY TAKEAWAYS", "IN HINDI"
+    centered(l1, _thumb_font(50), by + 16, (0, 0, 0))
+    centered(l2, _thumb_font(50), by + 78, (0, 0, 0))
+
+    canvas.save(out, "JPEG", quality=92)
 
 
 # ------------------------------------------------------------------ YouTube upload
@@ -1022,7 +1101,7 @@ def main():
         log(f"part {k} video: {total / 60:.1f} min")
 
         thumb = pdir / "thumb.jpg"
-        make_thumb(images[(k - 1) % len(images)], part.get("thumb_text"), thumb)
+        make_thumb(images[(k - 1) % len(images)], part.get("thumb_text"), thumb, k, n_parts)
 
         base_title = part.get("title_hi") or plan.get("video_title_hi") or meta["title"]
         title = f"{base_title} | भाग {k}" if n_parts > 1 else base_title

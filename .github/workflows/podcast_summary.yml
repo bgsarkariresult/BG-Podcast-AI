@@ -8,11 +8,11 @@ on:
         required: true
         type: string
       parts:
-        description: "Kitne part me video banana hai (lamba podcast ho to 4-6 rakho)"
+        description: "Kitne part me video banana hai (lamba podcast ho to 5-10 rakho)"
         required: false
         default: "2"
         type: choice
-        options: ["1", "2", "3", "4", "5", "6"]
+        options: ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]
       privacy:
         description: "Upload privacy"
         required: false
@@ -21,6 +21,21 @@ on:
         options: ["public", "unlisted", "private"]
       part2_delay_hours:
         description: "Har agla part pichle se kitne ghante baad publish ho (24 = roz 1 video, 0 = turant)"
+        required: false
+        default: "0"
+        type: string
+      part_from:
+        description: "Kis part se shuru karna hai (pehle batch me 1, dusre batch me 6)"
+        required: false
+        default: "1"
+        type: string
+      part_to:
+        description: "Kis part tak banana hai (0 = last tak; YouTube roz ~6 upload hi leta hai, to 5 rakho)"
+        required: false
+        default: "0"
+        type: string
+      first_offset_hours:
+        description: "Pehla part kitne ghante baad publish ho (0 = turant; dusre batch me 120 jaise)"
         required: false
         default: "0"
         type: string
@@ -80,6 +95,9 @@ jobs:
           PRIVACY: ${{ inputs.privacy }}
           PART2_DELAY_HOURS: ${{ inputs.part2_delay_hours }}
           FORCE: ${{ inputs.force }}
+          PART_FROM: ${{ inputs.part_from }}
+          PART_TO: ${{ inputs.part_to }}
+          FIRST_OFFSET_HOURS: ${{ inputs.first_offset_hours }}
           GEMINI_API_KEY_1: ${{ secrets.GEMINI_API_KEY_1 }}
           GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
           GEMINI_API_KEY_3: ${{ secrets.GEMINI_API_KEY_3 }}

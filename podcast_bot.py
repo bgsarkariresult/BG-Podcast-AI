@@ -562,6 +562,27 @@ def cache_put(vid, text):
         log(f"could not write transcript cache: {e}")
 
 
+def plan_cache_get(vid, n):
+    p = CACHE_DIR / f"{vid}_plan{n}.json"
+    try:
+        if p.exists():
+            d = json.loads(p.read_text(encoding="utf-8"))
+            if d.get("notes") and (d.get("plan") or {}).get("parts"):
+                return d["notes"], d["plan"]
+    except Exception as e:
+        log(f"plan cache unreadable: {e}")
+    return None
+
+
+def plan_cache_put(vid, n, notes, plan):
+    try:
+        CACHE_DIR.mkdir(exist_ok=True)
+        (CACHE_DIR / f"{vid}_plan{n}.json").write_text(
+            json.dumps({"notes": notes, "plan": plan}, ensure_ascii=False), encoding="utf-8")
+    except OSError as e:
+        log(f"could not write plan cache: {e}")
+
+
 def get_text(url, vid, force=False):
     if not force:
         cached = cache_get(vid)
@@ -1073,6 +1094,9 @@ def main():
     privacy = os.getenv("PRIVACY", "public") or "public"
     delay_h = float(os.getenv("PART2_DELAY_HOURS", "0") or 0)
     force = os.getenv("FORCE", "false").lower() == "true"
+    part_from = max(1, int(os.getenv("PART_FROM", "1") or 1))
+    part_to = int(os.getenv("PART_TO", "0") or 0) or n_parts  # 0 = up to the last part
+    first_offset_h = float(os.getenv("FIRST_OFFSET_HOURS", "0") or 0)
 
     vid = extract_id(url)
     done = load_done()
@@ -1089,21 +1113,30 @@ def main():
     log(f"podcast: {meta['title']} | {meta['channel']} | {meta['duration']}s")
     tg(f"▶️ Podcast summary शुरू: {meta['title']}\n{run_url()}")
 
-    text = get_text(url, vid, force)
-    notes = make_notes(text)
-
-    plan = llm_json(outline_prompt(meta, notes, n_parts))
+    cached = plan_cache_get(vid, n_parts)
+    if cached and part_from > 1:
+        notes, plan = cached  # second batch: same notes and the same part plan as the first run
+        log(f"reusing cached notes and plan ({len(plan.get('parts', []))} parts)")
+    else:
+        text = get_text(url, vid, force)
+        notes = make_notes(text)
+        plan = llm_json(outline_prompt(meta, notes, n_parts))
+        if not (plan.get("parts") or []):
+            raise RuntimeError("outline has no parts")
+        plan_cache_put(vid, n_parts, notes, plan)
     parts = plan.get("parts") or []
-    if not parts:
-        raise RuntimeError("outline has no parts")
     n_parts = min(n_parts, len(parts))
+    part_to = min(part_to, n_parts)
+    if part_from > part_to:
+        raise RuntimeError(f"part_from={part_from} is beyond the last part ({part_to})")
+    log(f"making parts {part_from}..{part_to} of {n_parts}")
 
     images = get_images(url, meta)
     clips = make_clips(images)
     yt = yt_service()
 
     results = []
-    for k in range(1, n_parts + 1):
+    for k in range(part_from, part_to + 1):
         part = parts[k - 1]
         log(f"--- part {k}/{n_parts}: {part.get('title_hi')}")
         pdir = WORK / f"part{k}"
@@ -1137,8 +1170,9 @@ def main():
             "(यह मूल पॉडकास्ट का हिंदी सारांश है। पूरी बातचीत के लिए ऊपर दिया ओरिजिनल वीडियो देखें।)"
         )
         publish_at = None
-        if k >= 2 and delay_h > 0:
-            publish_at = (datetime.now(timezone.utc) + timedelta(hours=delay_h * (k - 1))).strftime(
+        offset_h = first_offset_h + (delay_h * (k - part_from) if delay_h > 0 else 0)
+        if offset_h > 0:
+            publish_at = (datetime.now(timezone.utc) + timedelta(hours=offset_h)).strftime(
                 "%Y-%m-%dT%H:%M:%S.000Z")
         yid = upload(yt, video, title, desc, plan.get("tags", []), privacy, publish_at, thumb)
         results.append({"part": k, "id": yid, "title": title, "scheduled": publish_at,
@@ -1146,14 +1180,19 @@ def main():
         log(f"uploaded: https://youtu.be/{yid}")
         shutil.rmtree(pdir, ignore_errors=True)  # free disk
 
-    done[vid] = {"url": url, "title": meta["title"], "date": datetime.now(timezone.utc).isoformat(),
-                 "uploads": results}
-    DONE_FILE.write_text(json.dumps(done, ensure_ascii=False, indent=2), encoding="utf-8")
+    if part_to >= n_parts:  # last batch: remember the podcast as finished
+        prev = (done.get(vid) or {}).get("uploads", []) if part_from > 1 else []
+        done[vid] = {"url": url, "title": meta["title"], "date": datetime.now(timezone.utc).isoformat(),
+                     "uploads": prev + results}
+        DONE_FILE.write_text(json.dumps(done, ensure_ascii=False, indent=2), encoding="utf-8")
 
     lines = [f"✅ Podcast summary तैयार: {meta['title']}"]
     for r in results:
         extra = f" (शेड्यूल: {r['scheduled']})" if r["scheduled"] else ""
         lines.append(f"भाग {r['part']} ({r['minutes']} मिनट): https://youtu.be/{r['id']}{extra}")
+    if part_to < n_parts:
+        lines.append(f"➡️ अगला बैच: parts={n_parts}, part_from={part_to + 1} रखकर वही लिंक फिर चलाएँ "
+                     f"(अगले दिन; first_offset_hours में पहले बैच के बाद के घंटे डालें)")
     tg("\n".join(lines))
 
 

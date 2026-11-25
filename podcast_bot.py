@@ -241,24 +241,51 @@ def shrink_prompt(prompt, ratio):
     return prompt[:head] + "\n...[trimmed to fit the model limit]...\n" + prompt[-(n - head):]
 
 
-def llm(prompt, json_mode=True):
+def gemini_retry(prompt, json_mode=True, rounds=3):
+    """Gemini 503 ("high demand") and 429 are usually temporary: wait and retry before giving up."""
     err = None
-    # Gemini 503 ("high demand") and 429 are usually temporary: wait and retry before using the weaker Groq fallback.
-    for rnd in range(3):
+    for rnd in range(rounds):
         try:
             return gemini(prompt, json_mode)
         except Exception as e:
             err = e
-            log(f"Gemini round {rnd + 1}/3 failed: {str(e)[:400]}")
+            log(f"Gemini round {rnd + 1}/{rounds} failed: {str(e)[:400]}")
             if not GEMINI_KEYS:
                 break
-            if rnd < 2:
+            if rnd < rounds - 1:
                 time.sleep(40 * (rnd + 1))
-    log("Gemini unavailable; falling back to Groq")
+    raise err if err else RuntimeError("Gemini unavailable")
+
+
+def llm(prompt, json_mode=True):
     try:
-        return groq_llm(prompt, json_mode)
-    except Exception as e2:
-        raise RuntimeError(f"Gemini: {str(err)[:380]} || Groq: {str(e2)[:380]}")
+        return gemini_retry(prompt, json_mode)
+    except Exception as err:
+        log("Gemini unavailable; falling back to Groq")
+        try:
+            return groq_llm(prompt, json_mode)
+        except Exception as e2:
+            raise RuntimeError(f"Gemini: {str(err)[:380]} || Groq: {str(e2)[:380]}")
+
+
+GROQ_PIECE = 6000  # chars per Groq request, so one request stays under the free 8,000 tokens-per-minute limit
+
+
+def llm_notes(prompt_for, text):
+    """Bullet-point notes for one transcript chunk. Gemini first; if it stays down, Groq processes the SAME chunk
+    in small pieces (nothing is trimmed away), waiting between pieces to respect Groq's per-minute token limit."""
+    try:
+        return gemini_retry(prompt_for(text), json_mode=False)
+    except Exception as err:
+        log(f"Gemini unavailable for notes ({str(err)[:200]}); using Groq in small pieces")
+    pieces = [text[i:i + GROQ_PIECE] for i in range(0, len(text), GROQ_PIECE)]
+    out = []
+    for j, piece in enumerate(pieces, 1):
+        out.append(groq_llm(prompt_for(piece), json_mode=False).strip())
+        log(f"Groq notes piece {j}/{len(pieces)} done")
+        if j < len(pieces):
+            time.sleep(25)
+    return "\n".join(out)
 
 
 def parse_json(text):
@@ -553,9 +580,11 @@ def make_notes(text):
         return text
     notes = []
     for i, c in enumerate(chunks, 1):
-        p = (f"This is section {i} of {len(chunks)} of a podcast transcript. Extract the key points as 8-12 concise "
-             f"English bullet points. Keep names, numbers and examples. Output only the bullets.\n\nTRANSCRIPT:\n{c}")
-        notes.append(f"[Section {i}]\n" + llm(p, json_mode=False).strip())
+        def prompt_for(t, i=i):
+            return (f"This is part of section {i} of {len(chunks)} of a podcast transcript. Extract the key points as "
+                    f"8-12 concise English bullet points. Keep names, numbers and examples. Output only the "
+                    f"bullets.\n\nTRANSCRIPT:\n{t}")
+        notes.append(f"[Section {i}]\n" + llm_notes(prompt_for, c).strip())
         time.sleep(6)  # stay under the free-tier requests-per-minute limit
     return "\n\n".join(notes)
 

@@ -8,11 +8,11 @@ on:
         required: true
         type: string
       parts:
-        description: "Kitne part me video banana hai"
+        description: "Kitne part me video banana hai (lamba podcast ho to 4-6 rakho)"
         required: false
         default: "2"
         type: choice
-        options: ["1", "2", "3"]
+        options: ["1", "2", "3", "4", "5", "6"]
       privacy:
         description: "Upload privacy"
         required: false
@@ -20,7 +20,7 @@ on:
         type: choice
         options: ["public", "unlisted", "private"]
       part2_delay_hours:
-        description: "Part 2 (aur 3) kitne ghante baad publish ho (0 = turant)"
+        description: "Har agla part pichle se kitne ghante baad publish ho (24 = roz 1 video, 0 = turant)"
         required: false
         default: "0"
         type: string

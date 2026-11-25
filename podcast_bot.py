@@ -105,12 +105,21 @@ class ModelNotFound(Exception):
     pass
 
 
+_GEMINI_DEAD = {}  # model -> time.time() until which we skip it (quota exhausted / long outage)
+
+
+def _gemini_all_dead():
+    now = time.time()
+    return bool(GEMINI_MODELS) and all(_GEMINI_DEAD.get(m, 0) > now for m in GEMINI_MODELS)
+
+
 def _gemini_one(prompt, json_mode, model):
     """Round-robin over all Gemini keys; rotate to the next key on any failure."""
     global _key_i
     if not GEMINI_KEYS:
         raise RuntimeError("no Gemini keys set")
     last = None
+    quota_hits = 0
     for attempt in range(len(GEMINI_KEYS) * 4):
         key = GEMINI_KEYS[_key_i % len(GEMINI_KEYS)]
         body = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.7}}
@@ -139,6 +148,11 @@ def _gemini_one(prompt, json_mode, model):
             raise ModelNotFound(f"{model}: {r.text[:200]}")
         if r.status_code == 429 and 'limit": 0' in r.text:  # this project has no free quota for this model
             raise ModelNotFound(f"{model}: no free quota ({r.text[:160]})")
+        if r.status_code == 429 and "quota" in r.text.lower():
+            quota_hits += 1
+            if quota_hits >= len(GEMINI_KEYS) + 1:  # every key hit its quota: stop hammering
+                _GEMINI_DEAD[model] = time.time() + 900
+                raise RuntimeError(f"Gemini ({model}) quota exhausted on all keys; skipping it for 15 min")
         wait = 5
         if r.status_code == 429:
             m = re.search(r'retryDelay"?\s*:\s*"?(\d+)', r.text)
@@ -156,6 +170,9 @@ def gemini(prompt, json_mode=True):
         raise RuntimeError("no Gemini keys set")
     last = None
     for model in GEMINI_MODELS:
+        if _GEMINI_DEAD.get(model, 0) > time.time():
+            last = RuntimeError(f"{model} skipped (quota exhausted recently)")
+            continue
         try:
             return _gemini_one(prompt, json_mode, model)
         except ModelNotFound as e:
@@ -230,7 +247,13 @@ def groq_llm(prompt, json_mode=True):
             body["messages"][0]["content"] = prompt
             log(f"Groq 413: shrinking prompt to {len(prompt)} chars and retrying")
             continue
-        time.sleep(10 * (a + 1))
+        wait = 10 * (a + 1)
+        if r.status_code == 429:
+            m = re.search(r"try again in (?:(\d+)m)?\s*([\d.]+)s", r.text)
+            if m:
+                wait = min(int(m.group(1) or 0) * 60 + float(m.group(2)) + 2, 90)
+            log(f"Groq 429: waiting {wait:.0f}s")
+        time.sleep(wait)
     raise RuntimeError("Groq LLM failed: " + str(last))
 
 
@@ -245,6 +268,8 @@ def gemini_retry(prompt, json_mode=True, rounds=3):
     """Gemini 503 ("high demand") and 429 are usually temporary: wait and retry before giving up."""
     err = None
     for rnd in range(rounds):
+        if _gemini_all_dead():
+            raise RuntimeError("Gemini quota exhausted; using Groq")
         try:
             return gemini(prompt, json_mode)
         except Exception as e:

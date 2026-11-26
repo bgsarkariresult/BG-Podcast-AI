@@ -8,6 +8,7 @@ Runs on GitHub Actions (.github/workflows/podcast_summary.yml). Uses only free t
 Gemini (3 keys, round-robin), Groq (Whisper + LLM fallback), edge-tts, ffmpeg.
 """
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -641,7 +642,7 @@ def probe_duration(path):
                       "-of", "default=nw=1:nk=1", str(path)]).strip())
 
 
-def extract_frames(video, n_candidates=36, n_keep=8):
+def extract_frames(video, n_candidates=72, n_keep=8):
     from PIL import Image, ImageChops, ImageFilter, ImageStat
     dur = probe_duration(video)
     cands = []
@@ -858,37 +859,85 @@ def _thumb_font(size, bold_condensed=True):
     return ImageFont.load_default()
 
 
+_FACE_MODELS = {
+    "face_detection_yunet_2023mar.onnx": (
+        "face_detection_yunet", "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4"),
+    "face_recognition_sface_2021dec.onnx": (
+        "face_recognition_sface", "0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83484087c34e79"),
+}
+SAME_PERSON = 0.34  # face similarity at or above this means it is the same person
+
+
+def _face_model(name):
+    folder, digest = _FACE_MODELS[name]
+    path = Path.home() / ".cache" / "podcast_bot" / name
+    if not path.exists():
+        r = requests.get("https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/"
+                         f"{folder}/{name}", timeout=180)
+        r.raise_for_status()
+        if hashlib.sha256(r.content).hexdigest() != digest:
+            raise RuntimeError(f"{name}: downloaded file does not match")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(r.content)
+    return str(path)
+
+
 def _find_people(frame_paths):
-    """Return (left, right): the face shots to use for the two sides of the thumbnail.
-    Each shot is (score, path, (x, y, w, h)); either may be None."""
+    """Group the faces seen in the frames by person. Returns up to 2 lists of shots (the two people
+    seen most often, best shot first). The same person is never returned twice."""
     try:
         import cv2
-        det = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-        prof = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_profileface.xml")
+        det = cv2.FaceDetectorYN.create(_face_model("face_detection_yunet_2023mar.onnx"), "", (320, 320), 0.85)
+        rec = cv2.FaceRecognizerSF.create(_face_model("face_recognition_sface_2021dec.onnx"), "")
     except Exception as e:
-        log(f"thumbnail: face detection unavailable: {e}")
-        return [], []
-    left, right = [], []
+        log(f"thumbnail: face recognition unavailable: {e}")
+        return []
+    shots = []
     for fp in frame_paths:
         img = cv2.imread(str(fp))
         if img is None:
             continue
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        ih, iw = gray.shape
-        mn = (ih // 11, ih // 11)
-        faces = list(det.detectMultiScale(gray, 1.1, 6, minSize=mn))
-        if not faces:  # podcast guests often look sideways at each other
-            faces = list(prof.detectMultiScale(gray, 1.1, 6, minSize=mn))
-            faces += [(iw - x - w, y, w, h) for x, y, w, h in
-                      prof.detectMultiScale(cv2.flip(gray, 1), 1.1, 6, minSize=mn)]
-        for x, y, w, h in faces:
-            sharp = cv2.Laplacian(gray[y:y + h, x:x + w], cv2.CV_64F).var()
-            score = (h / ih) * min(sharp, 600) ** 0.5
-            shot = (score, Path(fp), (int(x), int(y), int(w), int(h)))
-            (left if x + w / 2 < iw / 2 else right).append(shot)
-    for side in (left, right):
-        side.sort(key=lambda c: -c[0])
-    return left, right
+        ih, iw = img.shape[:2]
+        det.setInputSize((iw, ih))
+        _, found = det.detect(img)
+        if found is None:
+            continue
+        boxes = [tuple(int(v) for v in f[:4]) for f in found]
+        for f, box in zip(found, boxes):
+            x, y, w, h = box
+            if h < ih / 11:
+                continue
+            face = img[max(y, 0):y + h, max(x, 0):x + w]
+            if not face.size:
+                continue
+            sharp = cv2.Laplacian(cv2.cvtColor(face, cv2.COLOR_BGR2GRAY), cv2.CV_64F).var()
+            eye_mid, eye_gap = (f[4] + f[6]) / 2, abs(f[6] - f[4])
+            turned = min(abs(f[8] - eye_mid) / max(eye_gap, 1), 1.0)  # 0 = looking at the camera
+            score = min(h / ih, 0.45) * min(sharp, 600) ** 0.5 * (1.0 - 0.5 * turned) * float(f[14])
+            feat = rec.feature(rec.alignCrop(img, f))
+            shots.append({"score": score, "path": Path(fp), "box": box, "feat": feat.copy(),
+                          "others": [b for b in boxes if b != box], "cx": (x + w / 2) / iw})
+
+    groups = []
+    for shot in sorted(shots, key=lambda c: -c["score"]):
+        match = [g for g in groups
+                 if any(rec.match(shot["feat"], m["feat"], cv2.FaceRecognizerSF_FR_COSINE) >= SAME_PERSON
+                        for m in g)]
+        if match:  # a shot that matches two groups proves they are one person: merge them
+            for g in match[1:]:
+                match[0].extend(g)
+                groups.remove(g)
+            match[0].append(shot)
+        else:
+            groups.append([shot])
+    groups.sort(key=lambda g: (-len(g), -max(m["score"] for m in g)))
+    for g in groups:
+        g.sort(key=lambda c: -c["score"])
+    # a face seen only once is usually a poster or an inserted clip, not the second speaker
+    need = 2 if len(frame_paths) > 5 else 1
+    people = groups[:1] + [g for g in groups[1:] if len(g) >= need][:1]
+    log(f"thumbnail: {len(shots)} faces, {len(people)} different people")
+    return people
 
 
 _REMBG = None
@@ -912,19 +961,26 @@ def _cutout(img):
 
 def _person_layer(shot, side):
     """A W x H transparent layer with one person placed on the given side."""
-    from PIL import Image, ImageChops, ImageDraw, ImageEnhance
-    _, path, (fx, fy, fw, fh) = shot
-    im = Image.open(path).convert("RGB")
-    face_h, face_y, face_x = 215, 255, 225 if side == "left" else W - 225
+    from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter
+    fx, fy, fw, fh = shot["box"]
+    im = Image.open(shot["path"]).convert("RGB")
+    face_h, face_y, face_x = 225, 270, 215 if side == "left" else W - 215
     # big enough face, and the picture must still reach the bottom of the thumbnail
     scale = max(face_h / fh, (H - face_y) / max(im.height - (fy + fh / 2), 1))
-    pw = 600
+    pw = 540
     x0 = 0 if side == "left" else W - pw
     # source rectangle that lands on this side of the canvas, limited to the real picture
     sx = fx + fw / 2 - (face_x - x0) / scale
     sy = fy + fh / 2 - face_y / scale
-    box = (max(0, int(sx)), max(0, int(sy)),
-           min(im.width, int(sx + pw / scale) + 1), min(im.height, int(sy + H / scale) + 1))
+    lo, hi = 0, im.width
+    for ox, _, ow, _ in shot["others"]:  # keep a neighbour in the same frame out of the crop
+        mid = int((fx + fw / 2 + ox + ow / 2) / 2)
+        if ox + ow / 2 < fx + fw / 2:
+            lo = max(lo, mid)
+        else:
+            hi = min(hi, mid)
+    box = (max(lo, int(sx)), max(0, int(sy)),
+           min(hi, int(sx + pw / scale) + 1), min(im.height, int(sy + H / scale) + 1))
     crop = im.crop(box)
     crop = crop.resize((max(1, round(crop.width * scale)), max(1, round(crop.height * scale))), Image.LANCZOS)
     crop = ImageEnhance.Brightness(crop).enhance(1.06)
@@ -947,7 +1003,27 @@ def _person_layer(shot, side):
     rgba.putalpha(ImageChops.multiply(alpha, fade))
     layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     layer.paste(rgba, (x0 + round((box[0] - sx) * scale), round((box[1] - sy) * scale)))
+    if cut:  # thin white outline so the person stands out
+        a = layer.getchannel("A")
+        edge = a.point(lambda v: 255 if v > 140 else 0).filter(ImageFilter.MaxFilter(9))
+        outline = Image.new("RGBA", (W, H), (255, 255, 255, 0))
+        outline.putalpha(ImageChops.multiply(edge.filter(ImageFilter.GaussianBlur(1)), fade_full(a, side)))
+        outline.alpha_composite(layer)
+        return outline
     return layer
+
+
+def fade_full(alpha, side):
+    """Mask that removes the outline near the inner side of the panel, where the cutout is feathered."""
+    from PIL import Image, ImageDraw
+    m = Image.new("L", (W, H), 255)
+    d = ImageDraw.Draw(m)
+    edge = 470 if side == "left" else W - 470
+    for i in range(80):
+        x = edge - i if side == "left" else edge + i
+        d.line([(x, 0), (x, H)], fill=int(255 * i / 80))
+    d.rectangle([edge, 0, W, H] if side == "left" else [0, 0, edge, H], fill=0)
+    return m
 
 
 def make_thumb(img_path, text, out, part_no=1, n_parts=1):
@@ -956,20 +1032,23 @@ def make_thumb(img_path, text, out, part_no=1, n_parts=1):
     from PIL import Image, ImageDraw, ImageFilter
     import math
     frames = sorted(WORK.glob("cand_*.jpg")) or [Path(img_path)]
-    left, right = _find_people(frames)
+    found = _find_people(frames)
 
-    def pick(shots):  # a different good frame for each part
-        top = shots[:3]
-        return top[(part_no - 1) % len(top)] if top else None
-
-    people = [(pick(left), "left"), (pick(right), "right")]
-    people = [(s, side) for s, side in people if s]
-    if not people:  # no face found: use the two sides of the frame
+    shots = []
+    for g in found:  # a different good frame for each part
+        top = g[:3]
+        shots.append(top[(part_no - 1) % len(top)])
+    if len(shots) == 2:
+        shots.sort(key=lambda c: c["cx"])  # keep each person on the side they sit on
+        people = list(zip(shots, ("left", "right")))
+    elif shots:
+        people = [(shots[0], "right")]
+    else:  # no face found: show the middle of the frame on the right
         with Image.open(img_path) as im:
             iw, ih = im.size
         fh = ih // 4
-        people = [((0, Path(img_path), (int(iw * cx) - fh // 2, int(ih * 0.22), fh, fh)), side)
-                  for cx, side in ((0.25, "left"), (0.75, "right"))]
+        box = (iw // 2 - fh // 2, int(ih * 0.22), fh, fh)
+        people = [({"path": Path(img_path), "box": box, "others": []}, "right")]
 
     canvas = Image.new("RGBA", (W, H), (0, 0, 0, 255))
     for _, side in people:  # soft white light behind each person
@@ -996,17 +1075,19 @@ def make_thumb(img_path, text, out, part_no=1, n_parts=1):
             size -= 2
         return _thumb_font(size, condensed)
 
-    def centered(txt, font, y, fill, shadow=False):
+    def centered(txt, font, y, fill, stroke=0, shadow=False):
         bb = d.textbbox((0, 0), txt, font=font)
         x, yy = cx - (bb[2] - bb[0]) // 2 - bb[0], y - bb[1]
         if shadow:
-            d.text((x + 5, yy + 6), txt, font=font, fill=(45, 45, 45))
-        d.text((x, yy), txt, font=font, fill=fill, stroke_width=1 if shadow else 0, stroke_fill=fill)
+            d.text((x + 6, yy + 8), txt, font=font, fill=(0, 0, 0), stroke_width=stroke, stroke_fill=(0, 0, 0))
+        d.text((x, yy), txt, font=font, fill=fill, stroke_width=stroke, stroke_fill=(0, 0, 0))
 
     # yellow topic line + huge white title
     topic = " ".join((text or "HINDI SUMMARY").upper().split())
-    centered(topic, fit(topic, 44, 500, False), 128, (255, 204, 0))
-    centered("PODCAST", fit("PODCAST", 190, 530, True), 188, (255, 255, 255), shadow=True)
+    f = fit(topic, 70, 540, True)
+    bb = d.textbbox((0, 0), topic, font=f)
+    centered(topic, f, 172 - (bb[3] - bb[1]), (255, 212, 0), 5, True)  # sits just above the title
+    centered("PODCAST", fit("PODCAST", 190, 520, True), 194, (255, 255, 255), 6, True)
 
     # waveform
     cy = 478
@@ -1029,11 +1110,14 @@ def make_thumb(img_path, text, out, part_no=1, n_parts=1):
             x = cx + sx * off
             d.line([(x, cy - h), (x, cy + h)], fill=white, width=5)
 
-    # white rounded badge at the bottom
-    d.rounded_rectangle([cx - 181, 570, cx + 181, H + 40], 40, fill=white)
-    l1, l2 = (f"PART {part_no}", "IN HINDI") if n_parts > 1 else ("HINDI", "SUMMARY")
-    centered(l1, fit(l1, 48, 320, False), 599, (0, 0, 0))
-    centered(l2, fit(l2, 48, 320, False), 655, (0, 0, 0))
+    # white rounded badge at the bottom, with a red label
+    d.rounded_rectangle([cx - 181, 566, cx + 181, H + 40], 40, fill=white)
+    l1, l2 = (f"PART {part_no}", "IN HINDI") if n_parts > 1 else ("SUMMARY", "IN HINDI")
+    centered(l1, fit(l1, 62, 320, True), 580, (0, 0, 0))
+    d.rounded_rectangle([cx - 135, 648, cx + 135, 708], 16, fill=(220, 20, 30))
+    f = fit(l2, 40, 240, True)
+    bb = d.textbbox((0, 0), l2, font=f)
+    centered(l2, f, 678 - (bb[3] - bb[1]) // 2, white)
 
     canvas.save(out, "JPEG", quality=92)
 
@@ -1135,14 +1219,29 @@ def outline_prompt(meta, notes, n):
         f"Key points / transcript of the podcast (in order):\n{notes}\n\n"
         f"Split the summary into exactly {n} part(s), by topic, in chronological order. Each part must stand on its own.\n"
         "Return JSON only, in this shape:\n"
-        '{"video_title_hi": "...", "description_hi": "...", "tags": ["..."], '
-        '"parts": [{"part": 1, "title_hi": "...", "thumb_text": "...", "focus": "...", "points": ["..."]}]}\n'
-        "Rules: titles are in easy everyday Hinglish written in Devanagari script (simple words people use daily, "
-        "English words like 'पॉडकास्ट', 'इंडिया', 'मनी' are fine; no heavy Sanskritized Hindi), catchy but truthful, "
-        "max 70 characters. description_hi is 3-5 lines in the same easy Hinglish (Devanagari). "
-        "10-15 tags (mix Hindi and English). thumb_text is 2-4 ENGLISH words. points are 6-12 English bullets per part "
-        "listing exactly what that part covers."
+        '{"video_title": "...", "description": "...", "tags": ["..."], '
+        '"parts": [{"part": 1, "title": "...", "thumb_text": "...", "focus": "...", "points": ["..."]}]}\n'
+        "Rules: video_title, every part title and the description MUST be Hinglish written in ROMAN (English) letters "
+        "only - never Devanagari. Example title: \"Sabse Khatarnak Emotion aur Thoughtlessness ka Sach\". "
+        "Use simple daily words, catchy but truthful, titles max 70 characters. "
+        "description is 3-5 lines of the same Roman Hinglish. "
+        "10-15 tags (mix Hinglish and English, Roman letters). thumb_text is 2-3 punchy ENGLISH words, "
+        "max 22 characters. points are 6-12 English bullets per part listing exactly what that part covers."
     )
+
+
+def to_roman(text):
+    """Make sure a title or description has no Devanagari in it."""
+    if not text or not re.search("[\u0900-\u097F]", text):
+        return text or ""
+    try:
+        out = llm_json("Rewrite this Hindi text as Hinglish in Roman (English) letters only, same meaning and "
+                       'line breaks. Return JSON only: {"text": "..."}\n\n' + text).get("text") or ""
+        if out and not re.search("[\u0900-\u097F]", out):
+            return out
+    except Exception as e:
+        log(f"could not convert to Roman letters: {e}")
+    return text
 
 
 STYLE_HINGLISH = (
@@ -1250,7 +1349,7 @@ def main():
     results = []
     for k in range(part_from, part_to + 1):
         part = parts[k - 1]
-        log(f"--- part {k}/{n_parts}: {part.get('title_hi')}")
+        log(f"--- part {k}/{n_parts}: {part.get('title')}")
         pdir = WORK / f"part{k}"
         pdir.mkdir()
         words = WORDS_PER_PART
@@ -1273,13 +1372,14 @@ def main():
         thumb = pdir / "thumb.jpg"
         make_thumb(images[(k - 1) % len(images)], part.get("thumb_text"), thumb, k, n_parts)
 
-        base_title = part.get("title_hi") or plan.get("video_title_hi") or meta["title"]
-        title = f"{base_title} | भाग {k}" if n_parts > 1 else base_title
+        base_title = to_roman(part.get("title") or part.get("title_hi") or plan.get("video_title")
+                              or plan.get("video_title_hi") or meta["title"])
+        title = f"{base_title[:88]} | Part {k}" if n_parts > 1 else base_title
         desc = (
-            (plan.get("description_hi") or "") +
-            (f"\n\n📌 भाग {k}/{n_parts}" if n_parts > 1 else "") +
-            f"\n\n🎙️ मूल पॉडकास्ट: {meta['title']} — {meta['channel']}\n{url}\n"
-            "(यह मूल पॉडकास्ट का हिंदी सारांश है। पूरी बातचीत के लिए ऊपर दिया ओरिजिनल वीडियो देखें।)"
+            to_roman(plan.get("description") or plan.get("description_hi")) +
+            (f"\n\n📌 Part {k}/{n_parts}" if n_parts > 1 else "") +
+            f"\n\n🎙️ Original podcast: {meta['title']} — {meta['channel']}\n{url}\n"
+            "(Yeh original podcast ki Hindi summary hai. Poori baatcheet ke liye upar diya original video dekhein.)"
         )
         publish_at = None
         offset_h = first_offset_h + (delay_h * (k - part_from) if delay_h > 0 else 0)

@@ -959,9 +959,19 @@ def _cutout(img):
         return None
 
 
-def _person_layer(shot, side):
+# thumbnail colours, used one after another: part 1 = blue/red, part 2 = yellow, part 3 = red, then again
+THUMB_THEMES = [
+    {"bg": (6, 8, 22), "left": (0, 140, 255), "right": (255, 40, 60), "outline": (255, 255, 255), "box": None},
+    {"bg": (8, 6, 0), "left": (255, 196, 0), "right": (255, 196, 0), "outline": (255, 212, 0),
+     "box": (255, 212, 0), "box_text": (0, 0, 0)},
+    {"bg": (28, 0, 4), "left": (235, 20, 35), "right": (235, 20, 35), "outline": (255, 255, 255),
+     "box": (255, 255, 255), "box_text": (200, 0, 15)},
+]
+
+
+def _person_layer(shot, side, outline_color=(255, 255, 255)):
     """A W x H transparent layer with one person placed on the given side."""
-    from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter
+    from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageStat
     fx, fy, fw, fh = shot["box"]
     im = Image.open(shot["path"]).convert("RGB")
     face_h, face_y, face_x = 225, 270, 215 if side == "left" else W - 215
@@ -983,12 +993,20 @@ def _person_layer(shot, side):
            min(hi, int(sx + pw / scale) + 1), min(im.height, int(sy + H / scale) + 1))
     crop = im.crop(box)
     crop = crop.resize((max(1, round(crop.width * scale)), max(1, round(crop.height * scale))), Image.LANCZOS)
-    crop = ImageEnhance.Brightness(crop).enhance(1.06)
+    face = im.crop((max(fx, 0), max(fy, 0), fx + fw, fy + fh)).convert("L")
+    light = ImageStat.Stat(face).mean[0]
+    if light < 135:  # lift a face that is in shadow
+        gamma = max(0.78, math.log(135 / 255) / math.log(max(light, 20) / 255))
+        crop = crop.point([round(255 * (v / 255) ** gamma) for v in range(256)] * 3)
+    crop = ImageEnhance.Brightness(crop).enhance(1.03)
     crop = ImageEnhance.Contrast(ImageEnhance.Color(crop).enhance(1.12)).enhance(1.08)
-    crop = ImageEnhance.Sharpness(crop).enhance(1.5)
+    crop = ImageEnhance.Sharpness(crop).enhance(1.3)
 
     cut = _cutout(crop)
-    alpha = cut.getchannel("A") if cut else Image.new("L", crop.size, 255)
+    if cut:  # trim the background fringe and smooth the jagged edge
+        alpha = cut.getchannel("A").filter(ImageFilter.MinFilter(3)).filter(ImageFilter.GaussianBlur(1.1))
+    else:
+        alpha = Image.new("L", crop.size, 255)
     # feather the edges that would otherwise show as a hard line
     fade = Image.new("L", crop.size, 255)
     fd = ImageDraw.Draw(fade)
@@ -1002,12 +1020,14 @@ def _person_layer(shot, side):
     rgba = crop.convert("RGBA")
     rgba.putalpha(ImageChops.multiply(alpha, fade))
     layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    layer.paste(rgba, (x0 + round((box[0] - sx) * scale), round((box[1] - sy) * scale)))
+    px = x0 + round((box[0] - sx) * scale)
+    px = min(px, 0) if side == "left" else max(px, W - crop.width)
+    layer.paste(rgba, (px, round((box[1] - sy) * scale)))
     if cut:  # thin white outline so the person stands out
         a = layer.getchannel("A")
-        edge = a.point(lambda v: 255 if v > 140 else 0).filter(ImageFilter.MaxFilter(9))
-        outline = Image.new("RGBA", (W, H), (255, 255, 255, 0))
-        outline.putalpha(ImageChops.multiply(edge.filter(ImageFilter.GaussianBlur(1)), fade_full(a, side)))
+        edge = a.filter(ImageFilter.GaussianBlur(4)).point(lambda v: max(0, min(255, (v - 14) * 10)))
+        outline = Image.new("RGBA", (W, H), outline_color + (0,))
+        outline.putalpha(ImageChops.multiply(edge.filter(ImageFilter.GaussianBlur(0.8)), fade_full(a, side)))
         outline.alpha_composite(layer)
         return outline
     return layer
@@ -1027,8 +1047,8 @@ def fade_full(alpha, side):
 
 
 def make_thumb(img_path, text, out, part_no=1, n_parts=1):
-    """Podcast-style thumbnail: two people cut out on the left and right with a white glow on a
-    black background, yellow topic line, huge PODCAST title, mic + waveform, white badge."""
+    """Podcast-style thumbnail: two people cut out on the left and right with a coloured glow on a
+    dark background (colours change per part), topic line, PODCAST title, mic + waveform, badge."""
     from PIL import Image, ImageDraw, ImageFilter
     import math
     frames = sorted(WORK.glob("cand_*.jpg")) or [Path(img_path)]
@@ -1050,15 +1070,16 @@ def make_thumb(img_path, text, out, part_no=1, n_parts=1):
         box = (iw // 2 - fh // 2, int(ih * 0.22), fh, fh)
         people = [({"path": Path(img_path), "box": box, "others": []}, "right")]
 
-    canvas = Image.new("RGBA", (W, H), (0, 0, 0, 255))
-    for _, side in people:  # soft white light behind each person
+    theme = THUMB_THEMES[(part_no - 1) % len(THUMB_THEMES)]
+    canvas = Image.new("RGBA", (W, H), theme["bg"] + (255,))
+    for _, side in people:  # soft coloured light behind each person
         glow = Image.new("L", (W, H), 0)
         gx = 230 if side == "left" else W - 230
-        ImageDraw.Draw(glow).ellipse([gx - 240, 110, gx + 240, 640], fill=175)
+        ImageDraw.Draw(glow).ellipse([gx - 240, 110, gx + 240, 640], fill=235)
         glow = glow.filter(ImageFilter.GaussianBlur(70))
-        canvas.paste((255, 255, 255, 255), (0, 0), glow)
+        canvas.paste(theme[side] + (255,), (0, 0), glow)
     for shot, side in people:
-        canvas.alpha_composite(_person_layer(shot, side))
+        canvas.alpha_composite(_person_layer(shot, side, theme["outline"]))
     canvas = canvas.convert("RGB")
     d = ImageDraw.Draw(canvas)
 
@@ -1086,7 +1107,14 @@ def make_thumb(img_path, text, out, part_no=1, n_parts=1):
     topic = " ".join((text or "HINDI SUMMARY").upper().split())
     f = fit(topic, 70, 540, True)
     bb = d.textbbox((0, 0), topic, font=f)
-    centered(topic, f, 172 - (bb[3] - bb[1]), (255, 212, 0), 5, True)  # sits just above the title
+    if theme["box"]:
+        f = fit(topic, 60, 500, True)
+        bb = d.textbbox((0, 0), topic, font=f)
+        tw, th = bb[2] - bb[0], bb[3] - bb[1]
+        d.rounded_rectangle([cx - tw // 2 - 22, 154 - th, cx + tw // 2 + 22, 180], 12, fill=theme["box"])
+        centered(topic, f, 167 - th, theme["box_text"])
+    else:
+        centered(topic, f, 172 - (bb[3] - bb[1]), (255, 212, 0), 5, True)  # sits just above the title
     centered("PODCAST", fit("PODCAST", 190, 520, True), 194, (255, 255, 255), 6, True)
 
     # waveform

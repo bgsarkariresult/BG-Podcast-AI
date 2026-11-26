@@ -858,99 +858,182 @@ def _thumb_font(size, bold_condensed=True):
     return ImageFont.load_default()
 
 
+def _find_people(frame_paths):
+    """Return (left, right): the face shots to use for the two sides of the thumbnail.
+    Each shot is (score, path, (x, y, w, h)); either may be None."""
+    try:
+        import cv2
+        det = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+        prof = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_profileface.xml")
+    except Exception as e:
+        log(f"thumbnail: face detection unavailable: {e}")
+        return [], []
+    left, right = [], []
+    for fp in frame_paths:
+        img = cv2.imread(str(fp))
+        if img is None:
+            continue
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        ih, iw = gray.shape
+        mn = (ih // 11, ih // 11)
+        faces = list(det.detectMultiScale(gray, 1.1, 6, minSize=mn))
+        if not faces:  # podcast guests often look sideways at each other
+            faces = list(prof.detectMultiScale(gray, 1.1, 6, minSize=mn))
+            faces += [(iw - x - w, y, w, h) for x, y, w, h in
+                      prof.detectMultiScale(cv2.flip(gray, 1), 1.1, 6, minSize=mn)]
+        for x, y, w, h in faces:
+            sharp = cv2.Laplacian(gray[y:y + h, x:x + w], cv2.CV_64F).var()
+            score = (h / ih) * min(sharp, 600) ** 0.5
+            shot = (score, Path(fp), (int(x), int(y), int(w), int(h)))
+            (left if x + w / 2 < iw / 2 else right).append(shot)
+    for side in (left, right):
+        side.sort(key=lambda c: -c[0])
+    return left, right
+
+
+_REMBG = None
+
+
+def _cutout(img):
+    """Remove the background. Returns an RGBA image, or None if that did not work."""
+    global _REMBG
+    try:
+        from rembg import new_session, remove
+        if _REMBG is None:
+            _REMBG = new_session("u2net")
+        out = remove(img, session=_REMBG, post_process_mask=True).convert("RGBA")
+        hist = out.getchannel("A").histogram()
+        cover = sum(hist[128:]) / (out.width * out.height)
+        return out if 0.12 < cover < 0.93 else None
+    except Exception as e:
+        log(f"thumbnail: background removal failed: {e}")
+        return None
+
+
+def _person_layer(shot, side):
+    """A W x H transparent layer with one person placed on the given side."""
+    from PIL import Image, ImageChops, ImageDraw, ImageEnhance
+    _, path, (fx, fy, fw, fh) = shot
+    im = Image.open(path).convert("RGB")
+    face_h, face_y, face_x = 215, 255, 225 if side == "left" else W - 225
+    # big enough face, and the picture must still reach the bottom of the thumbnail
+    scale = max(face_h / fh, (H - face_y) / max(im.height - (fy + fh / 2), 1))
+    pw = 600
+    x0 = 0 if side == "left" else W - pw
+    # source rectangle that lands on this side of the canvas, limited to the real picture
+    sx = fx + fw / 2 - (face_x - x0) / scale
+    sy = fy + fh / 2 - face_y / scale
+    box = (max(0, int(sx)), max(0, int(sy)),
+           min(im.width, int(sx + pw / scale) + 1), min(im.height, int(sy + H / scale) + 1))
+    crop = im.crop(box)
+    crop = crop.resize((max(1, round(crop.width * scale)), max(1, round(crop.height * scale))), Image.LANCZOS)
+    crop = ImageEnhance.Brightness(crop).enhance(1.06)
+    crop = ImageEnhance.Contrast(ImageEnhance.Color(crop).enhance(1.12)).enhance(1.08)
+    crop = ImageEnhance.Sharpness(crop).enhance(1.5)
+
+    cut = _cutout(crop)
+    alpha = cut.getchannel("A") if cut else Image.new("L", crop.size, 255)
+    # feather the edges that would otherwise show as a hard line
+    fade = Image.new("L", crop.size, 255)
+    fd = ImageDraw.Draw(fade)
+    span = 60 if cut else int(crop.width * 0.42)
+    for i in range(span):
+        x = crop.width - 1 - i if side == "left" else i
+        fd.line([(x, 0), (x, crop.height)], fill=int(255 * i / span))
+    if not cut:
+        for i in range(60):
+            fd.line([(0, i), (crop.width, i)], fill=int(255 * i / 60))
+    rgba = crop.convert("RGBA")
+    rgba.putalpha(ImageChops.multiply(alpha, fade))
+    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    layer.paste(rgba, (x0 + round((box[0] - sx) * scale), round((box[1] - sy) * scale)))
+    return layer
+
+
 def make_thumb(img_path, text, out, part_no=1, n_parts=1):
-    """Podcast-style thumbnail: black background, the two sides of a frame as left/right
-    'guest' panels with soft edges, small yellow line, huge white title, mic + waveform,
-    white badge at the bottom."""
-    from PIL import Image, ImageDraw, ImageEnhance, ImageFilter
+    """Podcast-style thumbnail: two people cut out on the left and right with a white glow on a
+    black background, yellow topic line, huge PODCAST title, mic + waveform, white badge."""
+    from PIL import Image, ImageDraw, ImageFilter
     import math
-    im = Image.open(img_path).convert("RGB")
-    canvas = Image.new("RGB", (W, H), (0, 0, 0))
+    frames = sorted(WORK.glob("cand_*.jpg")) or [Path(img_path)]
+    left, right = _find_people(frames)
 
-    def side_panel(box_src, size, side):
-        crop = im.crop(box_src).resize(size, Image.LANCZOS)
-        crop = ImageEnhance.Contrast(ImageEnhance.Color(crop).enhance(1.15)).enhance(1.1)
-        mask = Image.new("L", size, 255)
-        md = ImageDraw.Draw(mask)
-        fade = int(size[0] * 0.45)
-        for x in range(fade):  # feather the inner edge into the black background
-            v = int(255 * (x / fade) ** 1.3)
-            xx = size[0] - 1 - x if side == "left" else x
-            md.line([(xx, 0), (xx, size[1])], fill=v)
-        for y in range(40):  # and the bottom edge
-            v = int(255 * (y / 40))
-            md.line([(0, size[1] - 1 - y), (size[0], size[1] - 1 - y)], fill=v, width=1)
-        return crop, mask
+    def pick(shots):  # a different good frame for each part
+        top = shots[:3]
+        return top[(part_no - 1) % len(top)] if top else None
 
-    iw, ih = im.size
-    pw, ph = 560, H  # panel size on the canvas
-    src_h = ih
-    src_w = int(src_h * pw / ph)
-    src_w = min(src_w, iw // 2 + iw // 8)
-    # two-shot podcasts usually have one person on each side of the frame
-    lc, lm = side_panel((0, 0, src_w, src_h), (pw, ph), "left")
-    rc, rm = side_panel((iw - src_w, 0, iw, src_h), (pw, ph), "right")
-    canvas.paste(lc, (0, 0), lm)
-    canvas.paste(rc, (W - pw, 0), rm)
+    people = [(pick(left), "left"), (pick(right), "right")]
+    people = [(s, side) for s, side in people if s]
+    if not people:  # no face found: use the two sides of the frame
+        with Image.open(img_path) as im:
+            iw, ih = im.size
+        fh = ih // 4
+        people = [((0, Path(img_path), (int(iw * cx) - fh // 2, int(ih * 0.22), fh, fh)), side)
+                  for cx, side in ((0.25, "left"), (0.75, "right"))]
+
+    canvas = Image.new("RGBA", (W, H), (0, 0, 0, 255))
+    for _, side in people:  # soft white light behind each person
+        glow = Image.new("L", (W, H), 0)
+        gx = 230 if side == "left" else W - 230
+        ImageDraw.Draw(glow).ellipse([gx - 240, 110, gx + 240, 640], fill=175)
+        glow = glow.filter(ImageFilter.GaussianBlur(70))
+        canvas.paste((255, 255, 255, 255), (0, 0), glow)
+    for shot, side in people:
+        canvas.alpha_composite(_person_layer(shot, side))
+    canvas = canvas.convert("RGB")
     d = ImageDraw.Draw(canvas)
 
-    def centered(txt, font, y, fill, stroke=0, stroke_fill=(0, 0, 0)):
-        bb = d.textbbox((0, 0), txt, font=font, stroke_width=stroke)
-        d.text(((W - (bb[2] - bb[0])) // 2 - bb[0], y - bb[1]), txt, font=font, fill=fill,
-               stroke_width=stroke, stroke_fill=stroke_fill)
-        return bb[3] - bb[1]
-
-    # small yellow line on top
-    top = "HINDI SUMMARY" if n_parts == 1 else f"HINDI SUMMARY  |  PART {part_no}"
-    centered(top, _thumb_font(52), 70, (255, 200, 0), 3)
-
-    # huge white title (1-2 lines, shrinks to fit)
-    words = (text or "PODCAST").upper().split()
-    if len(words) > 3:
-        mid = (len(words) + 1) // 2
-        lines = [" ".join(words[:mid]), " ".join(words[mid:])]
-    elif len(words) == 3:
-        lines = [" ".join(words[:2]), words[2]]
-    else:
-        lines = [" ".join(words)]
-    size = 230 if len(lines) == 1 else 190
-    while size > 70:
-        f = _thumb_font(size)
-        if max(d.textbbox((0, 0), ln, font=f)[2] for ln in lines) <= 860:
-            break
-        size -= 6
-    f = _thumb_font(size)
-    y = 140
-    for ln in lines:
-        h = centered(ln, f, y, (255, 255, 255), 5)
-        y += h + 22
-
-    # mic icon + waveform
-    cy = 505
+    # only one person found: text goes to the free side
     cx = W // 2
-    for i in range(-22, 23):
-        if i == 0 or abs(i) < 4:
+    if len(people) == 1:
+        cx = 390 if people[0][1] == "right" else W - 390
+
+    def fit(txt, size, max_w, condensed):
+        while size > 22:
+            f = _thumb_font(size, condensed)
+            if d.textlength(txt, font=f) <= max_w:
+                break
+            size -= 2
+        return _thumb_font(size, condensed)
+
+    def centered(txt, font, y, fill, shadow=False):
+        bb = d.textbbox((0, 0), txt, font=font)
+        x, yy = cx - (bb[2] - bb[0]) // 2 - bb[0], y - bb[1]
+        if shadow:
+            d.text((x + 5, yy + 6), txt, font=font, fill=(45, 45, 45))
+        d.text((x, yy), txt, font=font, fill=fill, stroke_width=1 if shadow else 0, stroke_fill=fill)
+
+    # yellow topic line + huge white title
+    topic = " ".join((text or "HINDI SUMMARY").upper().split())
+    centered(topic, fit(topic, 44, 500, False), 128, (255, 204, 0))
+    centered("PODCAST", fit("PODCAST", 190, 530, True), 188, (255, 255, 255), shadow=True)
+
+    # waveform
+    cy = 478
+    for i in range(-33, 34):
+        if abs(i) < 13:
             continue
-        hgt = 14 + 52 * abs(math.sin(i * 0.9) * math.cos(i * 0.37)) * (1 - abs(i) / 30)
-        x = cx + i * 9
-        d.rounded_rectangle([x - 2, cy - hgt, x + 2, cy + hgt], 2, fill=(235, 175, 20))
-    d.rounded_rectangle([cx - 20, cy - 52, cx + 20, cy + 10], 20, outline=(255, 255, 255), width=5)
-    d.arc([cx - 38, cy - 30, cx + 38, cy + 34], 0, 180, fill=(255, 255, 255), width=5)
-    d.line([(cx, cy + 34), (cx, cy + 56)], fill=(255, 255, 255), width=5)
-    d.line([(cx - 22, cy + 56), (cx + 22, cy + 56)], fill=(255, 255, 255), width=5)
-    for k in range(-20, 21, 10):
-        d.line([(cx - 14, cy - 36 + k // 2 + 6), (cx + 14, cy - 36 + k // 2 + 6)], fill=(255, 255, 255), width=2)
+        hgt = 8 + 68 * abs(math.sin(i * 0.83) * math.cos(i * 0.29)) * (1 - abs(i) / 46)
+        x = cx + i * 6
+        d.line([(x, cy - hgt), (x, cy + hgt)], fill=(125, 100, 10), width=3)
+    # mic icon
+    white = (255, 255, 255)
+    d.rounded_rectangle([cx - 30, 413, cx + 30, 509], 30, fill=white)
+    for y in (443, 457, 471):
+        d.rounded_rectangle([cx - 16, y, cx + 16, y + 5], 2, fill=(0, 0, 0))
+    d.arc([cx - 43, 438, cx + 43, 526], 0, 180, fill=white, width=6)
+    d.line([(cx, 524), (cx, 540)], fill=white, width=6)
+    d.line([(cx - 15, 540), (cx + 15, 540)], fill=white, width=6)
+    for sx in (-1, 1):
+        for off, h in ((52, 14), (63, 24)):
+            x = cx + sx * off
+            d.line([(x, cy - h), (x, cy + h)], fill=white, width=5)
 
     # white rounded badge at the bottom
-    bw = 400
-    bx, by = (W - bw) // 2, 568
-    d.rounded_rectangle([bx, by, bx + bw, H + 40], 34, fill=(255, 255, 255))
-    if n_parts > 1:
-        l1, l2 = f"PART {part_no} OF {n_parts}", "FULL STORY"
-    else:
-        l1, l2 = "KEY TAKEAWAYS", "IN HINDI"
-    centered(l1, _thumb_font(50), by + 16, (0, 0, 0))
-    centered(l2, _thumb_font(50), by + 78, (0, 0, 0))
+    d.rounded_rectangle([cx - 181, 570, cx + 181, H + 40], 40, fill=white)
+    l1, l2 = (f"PART {part_no}", "IN HINDI") if n_parts > 1 else ("HINDI", "SUMMARY")
+    centered(l1, fit(l1, 48, 320, False), 599, (0, 0, 0))
+    centered(l2, fit(l2, 48, 320, False), 655, (0, 0, 0))
 
     canvas.save(out, "JPEG", quality=92)
 

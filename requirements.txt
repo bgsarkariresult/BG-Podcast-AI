@@ -6,3 +6,5 @@ Pillow
 google-api-python-client
 google-auth
 google-auth-httplib2
+rembg[cpu]
+opencv-python-headless<5

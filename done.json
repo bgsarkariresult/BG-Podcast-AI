@@ -179,5 +179,33 @@
         "minutes": 6.0
       }
     ]
+  },
+  "6BZHpEOIOGw": {
+    "url": "https://www.youtube.com/watch?v=6BZHpEOIOGw",
+    "title": "The Javed Akhtar and MS Dhoni Podcast | Chalchitra Talks | Vaibhav Munjal | ACKO India",
+    "date": "2026-11-28T02:21:12.919624+00:00",
+    "uploads": [
+      {
+        "part": 1,
+        "id": "Nc4iZAn42co",
+        "title": "Jersey #7, Failure aur Life Principles | Part 1",
+        "scheduled": null,
+        "minutes": 8.7
+      },
+      {
+        "part": 2,
+        "id": "UlWjqZdgdwg",
+        "title": "Captaincy, Saying No aur Creative Work | Part 2",
+        "scheduled": null,
+        "minutes": 5.7
+      },
+      {
+        "part": 3,
+        "id": "j28PfTDI2us",
+        "title": "Generational Shifts, Fitness aur Cricket | Part 3",
+        "scheduled": null,
+        "minutes": 7.0
+      }
+    ]
   }
 }
